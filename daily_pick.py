@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v5.1
-修复：KL_INE_FAIL_THRESHOLD 常量定义 + 海象运算符语法错误 + 熔断状态重置bug
+每日选股推送 - 主线增强版 v5.2
+修复：global声明重复导致的SyntaxError
 """
 import argparse
 import json
@@ -24,10 +24,10 @@ MIN_MARKET_CAP = 15.0
 MAIN_BOARD_MIN_STOCKS = 3
 RETRY_COUNT = 2
 RETRY_DELAY = 3
-FUND_FAIL_THRESHOLD = 3        # 连续失败N只 → 资金熔断
-KL_INE_FAIL_THRESHOLD = 5      # 连续失败N只 → K线熔断（← 这行之前漏了）
-DEFAULT_MIN_SCORE = 75         # 正常阈值
-DEGRADED_MIN_SCORE = 55        # 降级阈值
+FUND_FAIL_THRESHOLD = 3
+KL_INE_FAIL_THRESHOLD = 5
+DEFAULT_MIN_SCORE = 75
+DEGRADED_MIN_SCORE = 55
 
 HARD_FILTERS = {
     "st": True, "max_boards": 3, "max_turnover": 28.0,
@@ -278,7 +278,6 @@ def get_fund_flow(code: str):
     except Exception:
         _fund_fail_count += 1
         if _fund_fail_count >= FUND_FAIL_THRESHOLD:
-            global _fund_circuit_broken
             _fund_circuit_broken = True
             log(f"🚫 资金流向连续失败{_fund_fail_count}只，已熔断", "WARN")
         return 0.0, 0.0
@@ -487,10 +486,7 @@ def format_sector_section(sec_df: pd.DataFrame, status: str) -> str:
         msg += "\n**🔥 强势主线**\n"
         for _, r in strong.iterrows():
             net = r['主力净流入']
-            if abs(net) >= 1e8:
-                net_str = f"{net/1e8:+.2f}亿"
-            else:
-                net_str = f"{net/1e4:+.0f}万"
+            net_str = f"{net/1e8:+.2f}亿" if abs(net) >= 1e8 else f"{net/1e4:+.0f}万"
             msg += f"- {r['板块']} | 5日{r['5日涨幅']:+.1f}% | 资金{net_str}\n"
     weak = sec_df[sec_df["状态"] == "📉走弱"].head(3)
     if not weak.empty:
@@ -538,8 +534,6 @@ def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status, min_scor
 
 # ==================== 主流程 ====================
 def main():
-    global _fund_circuit_broken, _kline_circuit_broken
-
     p = argparse.ArgumentParser(description="每日选股推送")
     p.add_argument("--no-ma", action="store_true")
     p.add_argument("--no-fund", action="store_true")
