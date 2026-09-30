@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v5.5
-修复：涨停池聚合兜底路径缺少「状态」列导致KeyError
+每日选股推送 - 主线增强版 v5.6
+修复：探针熔断未正确触发 + 评分循环逐个重试极慢 + 快速失败机制
 """
 import argparse
 import json
@@ -18,10 +18,6 @@ import numpy as np
 
 # ==================== 配置 ====================
 DEFAULT_TOP_N = 15
-MAX_BOARDS = 3
-MAX_TURNOVER = 28.0
-MIN_MARKET_CAP = 15.0
-MAIN_BOARD_MIN_STOCKS = 3
 RETRY_COUNT = 3
 RETRY_DELAY = 5
 FUND_FAIL_THRESHOLD = 3
@@ -50,6 +46,8 @@ _fund_circuit_broken = False
 _fund_fail_count = 0
 _kline_circuit_broken = False
 _kline_fail_count = 0
+_fund_fast_fail = False   # 新增：快速失败标志
+_kline_fast_fail = False  # 新增：快速失败标志
 
 
 # ==================== 基础工具 ====================
@@ -59,15 +57,23 @@ def log(msg: str, level: str = "INFO"):
 
 
 def retry_with_backoff(func, *args, **kwargs):
+    """指数退避重试，连续RemoteDisconnected快速放弃"""
+    global _fund_fast_fail, _kline_fast_fail
     last_error = None
     for i in range(RETRY_COUNT):
         try:
             return func(*args, **kwargs)
         except Exception as e:
             last_error = e
+            err_str = str(e)
+            # 快速失败：如果是连接被断，CI环境里重试也没用
+            if "RemoteDisconnected" in err_str or "Connection aborted" in err_str:
+                if i >= 1:  # 只重试1次就放弃（总共2次尝试）
+                    log(f"🚫 连接被拒，快速放弃: {err_str[:60]}", "WARN")
+                    return None
             if i < RETRY_COUNT - 1:
                 wait = RETRY_DELAY * (2 ** i)
-                log(f"⏳ 重试{i+1}/{RETRY_COUNT} 等待{wait}s: {str(e)[:80]}", "WARN")
+                log(f"⏳ 重试{i+1}/{RETRY_COUNT} 等待{wait}s: {err_str[:80]}", "WARN")
                 time.sleep(wait)
     return None
 
@@ -204,10 +210,10 @@ def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ==================== K线（带熔断）====================
+# ==================== K线（带熔断+快速失败）====================
 def get_kline(code: str, days: int = 60):
-    global _kline_circuit_broken, _kline_fail_count
-    if _kline_circuit_broken:
+    global _kline_circuit_broken, _kline_fail_count, _kline_fast_fail
+    if _kline_circuit_broken or _kline_fast_fail:
         return None
     try:
         import akshare as ak
@@ -262,10 +268,10 @@ def check_return_shot(df):
         return False
 
 
-# ==================== 资金流向（带熔断）====================
+# ==================== 资金流向（带熔断+快速失败）====================
 def get_fund_flow(code: str):
-    global _fund_circuit_broken, _fund_fail_count
-    if _fund_circuit_broken:
+    global _fund_circuit_broken, _fund_fail_count, _fund_fast_fail
+    if _fund_circuit_broken or _fund_fast_fail:
         return 0.0, 0.0
     try:
         import akshare as ak
@@ -350,7 +356,6 @@ def _fetch_fund_flow_rank():
 
 
 def _build_from_limitup(zt_df):
-    """涨停池聚合兜底，直接带状态列"""
     if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
         return pd.DataFrame()
     vc = zt_df["industry"].value_counts()
@@ -358,7 +363,6 @@ def _build_from_limitup(zt_df):
     for name, cnt in vc.items():
         if name in (None, "未知", ""):
             continue
-        # 按涨停家数直接给状态
         if cnt >= 3:
             status = "🔥强势主线"
         elif cnt >= 2:
@@ -379,7 +383,6 @@ def get_sector_rotation(zt_df=None):
     status = "ok"
     seen = set()
 
-    # 1) 同花顺
     try:
         d = _fetch_industry_from_ths()
         if d is not None and not d.empty:
@@ -389,7 +392,6 @@ def get_sector_rotation(zt_df=None):
     except Exception as e:
         log(f"⚠ 同花顺源失败: {e}", "WARN"); status = "同花顺源失败"
 
-    # 2) 东财
     try:
         d = _fetch_industry_from_em()
         if d is not None and not d.empty:
@@ -400,7 +402,6 @@ def get_sector_rotation(zt_df=None):
         log(f"⚠ 东财行业榜失败: {e}", "WARN")
         if status == "ok": status = "东财行业榜失败"
 
-    # 3) 资金流排名
     try:
         d = _fetch_fund_flow_rank()
         if d is not None and not d.empty:
@@ -418,7 +419,6 @@ def get_sector_rotation(zt_df=None):
         log(f"⚠ 东财资金流排名失败: {e}", "WARN")
         if status == "ok": status = "资金流排名不可用"
 
-    # 4) 兜底
     if not rows:
         log("⚠ 外部板块源全挂，启用涨停池聚合兜底", "WARN")
         d = _build_from_limitup(zt_df)
@@ -513,7 +513,7 @@ def score_stock(row, sector_counts, use_fund, use_ma):
         score += s; reasons.append(f"连板{bc}层(+{s})")
 
     ind = str(row.get("industry", "未知"))
-    if sector_counts.get(ind, 0) >= MAIN_BOARD_MIN_STOCKS:
+    if sector_counts.get(ind, 0) >= 3:
         s = weights["sector_main"]
         score += s; reasons.append(f"主线({ind}{sector_counts[ind]}家)(+{s})")
 
@@ -623,6 +623,8 @@ def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status, min_scor
 
 # ==================== 主流程 ====================
 def main():
+    global _fund_circuit_broken, _kline_circuit_broken, _fund_fail_count, _kline_fail_count
+
     p = argparse.ArgumentParser(description="每日选股推送")
     p.add_argument("--no-ma", action="store_true")
     p.add_argument("--no-fund", action="store_true")
@@ -641,7 +643,7 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v5.5 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v5.6 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
         min_score = args.min_score if args.min_score is not None else DEFAULT_MIN_SCORE
@@ -654,7 +656,7 @@ def main():
                 "\n**原因**: 最近交易日涨停池均为空")
             sys.exit(1)
 
-        # 2. 板块主线（传涨停池兜底）
+        # 2. 板块主线
         log("🌐 板块主线监测...")
         sec_df, sec_status = get_sector_rotation(df_raw)
         log(f"🌐 板块数据 rows={len(sec_df)} | status={sec_status}")
@@ -688,9 +690,18 @@ def main():
             code = str(row.get("code", "")).zfill(6)
             get_fund_flow(code)
             get_kline(code)
+
+        # 5.5 强制检查熔断（修复：探针3只全失败时确保熔断标志被设置）
+        if _fund_fail_count >= FUND_FAIL_THRESHOLD and not _fund_circuit_broken:
+            _fund_circuit_broken = True
+            log(f"🚫 探针后强制熔断资金接口（失败{_fund_fail_count}次）", "WARN")
+        if _kline_fail_count >= KL_INE_FAIL_THRESHOLD and not _kline_circuit_broken:
+            _kline_circuit_broken = True
+            log(f"🚫 探针后强制熔断K线接口（失败{_kline_fail_count}次）", "WARN")
+
         log(f"🔬 预检完成: 资金熔断={_fund_circuit_broken} K线熔断={_kline_circuit_broken}")
 
-        # 6. 降级
+        # 6. 降级判定
         use_fund = not args.no_fund and not _fund_circuit_broken
         use_ma = not args.no_ma and not _kline_circuit_broken
         if (_fund_circuit_broken or _kline_circuit_broken) and args.min_score is None:
@@ -705,7 +716,8 @@ def main():
             s, rs = score_stock(row, sector_counts, use_fund=use_fund, use_ma=use_ma)
             scores.append(s); all_reasons.append(rs)
             if (idx + 1) % 10 == 0:
-                log(f"  ⏳ {idx+1}/{len(df)} 只 ({time.time()-t0:.1f}s)")
+                elapsed = time.time() - t0
+                log(f"  ⏳ {idx+1}/{len(df)} 只 ({elapsed:.1f}s)")
 
         df = df.copy()
         df["score"] = scores
