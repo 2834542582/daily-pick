@@ -1,4 +1,4 @@
-name: 每日选股推送
+name: daily-G
 
 on:
   workflow_dispatch:
@@ -9,10 +9,10 @@ on:
         default: 'full'
         type: choice
         options:
-          - fast       # 主线+资金，不拉K线，约30秒
-          - full       # 完整版：含均线多头+回马枪，约2-5分钟
-          - no_fund    # 只看主线和形态，资金接口挂了时用
-          - keepalive  # 仅保活，防止60天无活动被禁用
+          - fast
+          - full
+          - no_fund
+          - keepalive
       top_n:
         description: '推送前N只'
         required: false
@@ -24,26 +24,19 @@ on:
         default: ''
         type: string
   schedule:
-    # GitHub Actions 用 UTC，无时区配置。公式：北京时间 - 8 = UTC
-    # 14:55 → 6:55  收盘前5分钟：板块异动速报
     - cron: '55 6 * * 1-5'
-    # 15:05 → 7:05  收盘即推：抢抓封板瞬间
     - cron: '5 7 * * 1-5'
-    # 16:30 → 8:30  完整复盘：含均线多头+回马枪+资金验证（主任务）
     - cron: '30 8 * * 1-5'
-    # 20:00 → 12:00 二次确认：看尾盘是否炸板、封单变化
     - cron: '0 12 * * 1-5'
-    # 次日 8:50 → 0:50（前一日 UTC）+ 周六 0:50 兜底，防止跨日漏跑
     - cron: '50 0 * * 1-6'
 
 permissions:
-  contents: write   # 用于 commit 回存选股结果
+  contents: write
 
 jobs:
   pick:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # 防止定时任务堆积重叠执行
     concurrency:
       group: stock-picker
       cancel-in-progress: false
@@ -73,7 +66,6 @@ jobs:
       - name: 判定运行模式与时段
         id: meta
         run: |
-          # 非手动触发时，按 cron 时间点推断模式
           if [ "${{ github.event_name }}" = "schedule" ]; then
             case "${{ github.event.schedule }}" in
               '55 6 * * 1-5')  MODE=fast;     TAG="收盘前速报";;
@@ -92,10 +84,10 @@ jobs:
           echo "run_id=${{ github.run_id }}" >> $GITHUB_OUTPUT
           echo "▶ 模式=$MODE | 时段=$TAG | 触发=${{ github.event_name }}"
 
-      - name: 保活（不跑选股）
+      - name: 保活
         if: steps.meta.outputs.mode == 'keepalive'
         run: |
-          echo "💓 keepalive 心跳，防止定时任务被禁用"
+          echo "💓 keepalive 心跳"
           echo "last_run=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > keepalive.txt
           exit 0
 
@@ -128,3 +120,11 @@ jobs:
             git commit -m "chore: 选股结果 ${{ steps.meta.outputs.tag }} (${{ steps.meta.outputs.run_id }})"
             git push
           fi
+
+      - name: 上传调试文件
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs
+          path: debug/
+          retention-days: 7
