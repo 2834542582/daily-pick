@@ -14,6 +14,7 @@ CFG = {
     "unlock_days": 5,
     "unlock_max": 40,
     "min_score": 30,
+    "kline_lookback": 30,  # 拉最近N天，取最后一根
 }
 
 def get_trade_date():
@@ -21,8 +22,13 @@ def get_trade_date():
         return CFG["date"]
     return datetime.datetime.now().strftime("%Y%m%d")
 
+def _to_num(x):
+    try:
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return 0.0
+
 def get_limit_up_pool(date_str):
-    """获取涨停池"""
     try:
         df = ak.stock_zt_pool_em(date=date_str)
         return df
@@ -30,20 +36,49 @@ def get_limit_up_pool(date_str):
         print(f"⚠️ 获取涨停池失败: {e}")
         return pd.DataFrame()
 
-def get_unlock_calendar():
-    """获取解禁日历"""
+def get_kline(code):
+    """拉最近N天日线，返回最新一根（Series）或 None"""
+    end = datetime.datetime.now()
+    start = end - datetime.timedelta(days=CFG["kline_lookback"] * 2)
+    for fn in [
+        lambda: ak.stock_zh_a_hist(symbol=code, period="daily",
+                 start_date=start.strftime("%Y%m%d"),
+                 end_date=end.strftime("%Y%m%d"), adjust="qfq"),
+        lambda: ak.stock_zh_a_daily(symbol=code,
+                 start_date=start.strftime("%Y%m%d"),
+                 end_date=end.strftime("%Y%m%d"), adjust="qfq"),
+    ]:
+        try:
+            df = fn()
+            if df is not None and not df.empty:
+                df = df.sort_values("日期" if "日期" in df.columns else df.columns[0])
+                return df.iloc[-1]
+        except Exception:
+            continue
+    return None
+
+def load_unlock_ratios():
+    """返回 {code: 解禁比例}"""
+    ratios = {}
     try:
         df = ak.stock_restricted_release_queue_em()
-        return df
     except Exception as e:
         print(f"⚠️ 解禁接口失败: {e}")
-        return pd.DataFrame()
+        return ratios
+    if df is None or df.empty:
+        return ratios
+    # 自适应找代码列和解禁比例列
+    code_col = next((c for c in df.columns if "代码" in c), None)
+    ratio_col = next((c for c in df.columns if "比例" in c or "占比" in c), None)
+    if not code_col:
+        return ratios
+    for _, r in df.iterrows():
+        ratios[str(r[code_col]).zfill(6)] = _to_num(r.get(ratio_col, 0))
+    return ratios
 
-def calc_score(row_dict, unlock_ratio=0):
-    """计算综合评分"""
+def calc_score(row_dict, unlock_ratio=0.0):
     score = 50
-
-    turnover = float(row_dict.get("换手率", 0) or 0)
+    turnover = _to_num(row_dict.get("换手率", 0))
     if turnover > 15:
         score += 12
     elif turnover > 8:
@@ -51,7 +86,7 @@ def calc_score(row_dict, unlock_ratio=0):
     elif turnover > 3:
         score += 4
 
-    amount = float(row_dict.get("成交额", 0) or 0)
+    amount = _to_num(row_dict.get("成交额", 0))
     if amount > 20e8:
         score += 15
     elif amount > 10e8:
@@ -59,17 +94,16 @@ def calc_score(row_dict, unlock_ratio=0):
     elif amount > 3e8:
         score += 5
 
-    change = float(row_dict.get("涨跌幅", 0) or 0)
+    change = _to_num(row_dict.get("涨跌幅", 0))
     if change >= 9.8:
         score += 10
 
-    circ_mv = float(row_dict.get("流通市值", 0) or 0)
+    circ_mv = _to_num(row_dict.get("流通市值", 0))
     if 20e8 < circ_mv < 100e8:
         score += 8
 
     if unlock_ratio > CFG["unlock_max"]:
         score -= 15
-
     return max(0, min(score, 100))
 
 def pick():
@@ -80,64 +114,35 @@ def pick():
     if zt_df is None or zt_df.empty:
         print("📭 涨停池为空（非交易日/接口限流/数据未更新）")
         return pd.DataFrame()
-
     print(f"涨停池 {len(zt_df)} 只")
 
-    unlock_df = get_unlock_calendar()
-    unlock_set = set()
-    if unlock_df is not None and not unlock_df.empty:
-        try:
-            unlock_codes = unlock_df["代码"].astype(str).tolist()
-            unlock_set = set(unlock_codes)
-            print(f"🛡️ 解禁池 {len(unlock_set)} 只")
-        except Exception as e:
-            print(f"⚠️ 解禁数据处理异常: {e}")
+    unlock_ratios = load_unlock_ratios()
+    if unlock_ratios:
+        print(f"🛡️ 解禁池 {len(unlock_ratios)} 只，将用于扣分")
+    else:
+        print("ℹ️ 解禁数据未取到，跳过解禁风控")
 
-    results = []
-    blocked = 0
-    miss = 0
+    # 自适应找涨停池字段
+    code_col = next((c for c in zt_df.columns if "代码" in c), zt_df.columns[0])
+    name_col = next((c for c in zt_df.columns if "名称" in c), zt_df.columns[1])
 
-    for idx, row in zt_df.iterrows():
-        code = str(row.get("代码", "")).zfill(6)
-        name = str(row.get("名称", ""))
+    results, blocked, miss = [], 0, 0
 
-        # 剔除ST
-        if "ST" in name or "st" in name:
+    for _, row in zt_df.iterrows():
+        code = str(row.get(code_col, "")).zfill(6)
+        name = str(row.get(name_col, ""))
+
+        if "ST" in name.upper():
             blocked += 1
             continue
 
-        # 解禁剔除
-        if code in unlock_set:
-            blocked += 1
-            continue
-
-        # 拉K线验证
-        try:
-            kline = ak.stock_zh_a_hist(
-                symbol=code,
-                period="daily",
-                start_date=date_str,
-                end_date=date_str,
-                adjust="qfq"
-            )
-            if kline is None or kline.empty:
-                miss += 1
-                continue
-        except Exception:
+        bar = get_kline(code)
+        if bar is None:
             miss += 1
             continue
 
-        # 解禁比例
-        unlock_ratio = 0
-        if unlock_df is not None and not unlock_df.empty:
-            try:
-                mask = unlock_df["代码"].astype(str) == code
-                if mask.any():
-                    unlock_ratio = float(unlock_df.loc[mask, "解禁比例"].values[0] or 0)
-            except Exception:
-                pass
+        unlock_ratio = unlock_ratios.get(code, 0.0)
 
-        # 构造字典传入评分
         row_dict = {
             "换手率": row.get("换手率", 0),
             "成交额": row.get("成交额", 0),
@@ -153,12 +158,13 @@ def pick():
             "代码": code,
             "名称": name,
             "评分": score,
-            "换手率": turnover if 'turnover' in dir() else row_dict["换手率"],
-            "成交额_亿": round(float(row_dict["成交额"]) / 1e8, 1),
-            "涨跌幅": row_dict["涨跌幅"],
+            "换手率": _to_num(row_dict["换手率"]),
+            "成交额_亿": round(_to_num(row_dict["成交额"]) / 1e8, 1),
+            "涨跌幅": _to_num(row_dict["涨跌幅"]),
+            "解禁占比": unlock_ratio,
         })
 
-    print(f"过滤后 {len(results)} 只 | 解禁剔除{blocked} | K线缺失{miss}")
+    print(f"达标 {len(results)} 只 | 解禁剔除{blocked} | K线缺失{miss}")
 
     if not results:
         print("📭 今日无符合条件标的 —— 空仓也是策略")
@@ -177,36 +183,29 @@ def push_wecom(df, webhook):
         for _, row in top.iterrows():
             lines.append(
                 f"{row['名称']}({row['代码']}) 评分{row['评分']} | "
-                f"{float(row.get('换手率', 0)):.1f}%换 | {float(row.get('成交额_亿', 0)):.1f}亿"
+                f"{_to_num(row.get('换手率')):.1f}%换 | "
+                f"{_to_num(row.get('成交额_亿')):.1f}亿"
+                + (f" | ⚠️解禁{_to_num(row.get('解禁占比')):.0f}%" if _to_num(row.get('解禁占比')) > 0 else "")
             )
         content = "\n".join(lines)
 
-    data = {
-        "msgtype": "text",
-        "text": {"content": content}
-    }
-
+    data = {"msgtype": "text", "text": {"content": content}}
     req = urllib.request.Request(
-        webhook,
-        data=json.dumps(data).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-
+        webhook, data=json.dumps(data).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            result = resp.read().decode("utf-8")
-            print(f"推送结果: {result}")
+            print(f"推送结果: {resp.read().decode('utf-8')}")
     except Exception as e:
         print(f"推送失败: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="每日选股推送")
-    parser.add_argument("--mode", default="first", help="选股模式")
-    parser.add_argument("--top", type=int, default=15, help="推送前N只")
-    parser.add_argument("--rank", action="store_true", help="按评分排序")
-    parser.add_argument("--no-push", action="store_true", help="不推送")
+    parser.add_argument("--mode", default="first")
+    parser.add_argument("--top", type=int, default=15)
+    parser.add_argument("--rank", action="store_true")
+    parser.add_argument("--no-push", action="store_true")
     args = parser.parse_args()
-
     CFG["top_n"] = args.top
 
     out = pick()
@@ -223,7 +222,6 @@ def main():
             push_wecom(out, wh)
         else:
             print("⚠️ WECOM_WEBHOOK 未配置，跳过推送")
-
     return 0
 
 if __name__ == "__main__":
