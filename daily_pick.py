@@ -1,9 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v5.6
+每日选股推送 - 主线增强版 v5.7
 修复：探针熔断未正确触发 + 评分循环逐个重试极慢 + 快速失败机制
+v5.7 新增：
+  1) 全局给 requests 打默认超时补丁，彻底解决 akshare 挂死
+  2) 修正 stock_individual_fund_flow 缺 market 参数的调用
+  3) retry_with_backoff 增加 ReadTimeout/超时快速失败
+  4) 交易日历剔除未来日期
+  5) K 线成功时清零失败计数，避免误熔断
 """
+# ==================== 全局 requests 超时补丁（必须在 akshare 之前）====================
+import requests
+
+_ORIG_SESSION_REQUEST = requests.Session.request
+
+
+def _patched_session_request(self, method, url, **kwargs):
+    if kwargs.get("timeout") is None:
+        kwargs["timeout"] = (5, 12)  # (连接超时 5s, 读取超时 12s)
+    return _ORIG_SESSION_REQUEST(self, method, url, **kwargs)
+
+
+requests.Session.request = _patched_session_request
+# 兼容 requests.get / requests.post 直调场景
+_ORIG_API_REQUEST = requests.api.request
+
+
+def _patched_api_request(method, url, **kwargs):
+    if kwargs.get("timeout") is None:
+        kwargs["timeout"] = (5, 12)
+    return _ORIG_API_REQUEST(method, url, **kwargs)
+
+
+requests.api.request = _patched_api_request
+requests.get = lambda url, **kw: _patched_api_request("get", url, **kw)
+requests.post = lambda url, **kw: _patched_api_request("post", url, **kw)
+# ====================================================================================
+
 import argparse
 import json
 import os
@@ -46,8 +80,8 @@ _fund_circuit_broken = False
 _fund_fail_count = 0
 _kline_circuit_broken = False
 _kline_fail_count = 0
-_fund_fast_fail = False   # 新增：快速失败标志
-_kline_fast_fail = False  # 新增：快速失败标志
+_fund_fast_fail = False
+_kline_fast_fail = False
 
 
 # ==================== 基础工具 ====================
@@ -57,19 +91,22 @@ def log(msg: str, level: str = "INFO"):
 
 
 def retry_with_backoff(func, *args, **kwargs):
-    """指数退避重试，连续RemoteDisconnected快速放弃"""
+    """指数退避重试；连接被断/读超时快速放弃（CI 环境重试意义不大）"""
     global _fund_fast_fail, _kline_fast_fail
     last_error = None
+    FAST_FAIL_KEYS = (
+        "RemoteDisconnected", "Connection aborted",
+        "ReadTimeout", "read timed out", "timed out", "Timeout",
+    )
     for i in range(RETRY_COUNT):
         try:
             return func(*args, **kwargs)
         except Exception as e:
             last_error = e
             err_str = str(e)
-            # 快速失败：如果是连接被断，CI环境里重试也没用
-            if "RemoteDisconnected" in err_str or "Connection aborted" in err_str:
-                if i >= 1:  # 只重试1次就放弃（总共2次尝试）
-                    log(f"🚫 连接被拒，快速放弃: {err_str[:60]}", "WARN")
+            if any(k in err_str for k in FAST_FAIL_KEYS):
+                if i >= 1:  # 只重试 1 次就放弃（总共 2 次尝试）
+                    log(f"🚫 连接/读超时，快速放弃: {err_str[:60]}", "WARN")
                     return None
             if i < RETRY_COUNT - 1:
                 wait = RETRY_DELAY * (2 ** i)
@@ -154,6 +191,8 @@ def _get_recent_trade_dates(n: int = 10) -> List[str]:
             return []
         cal = cal.copy()
         cal["trade_date"] = pd.to_datetime(cal["trade_date"])
+        # 剔除未来日期（sina 日历偶发脏数据）
+        cal = cal[cal["trade_date"] <= pd.Timestamp.today()]
         cal = cal.sort_values("trade_date", ascending=False)
         return [d.strftime("%Y%m%d") for d in cal["trade_date"].head(n)]
     except Exception as e:
@@ -219,23 +258,23 @@ def get_kline(code: str, days: int = 60):
         import akshare as ak
         end = datetime.now()
         start = end - timedelta(days=days * 2)
-        for fn in [
-            lambda: ak.stock_zh_a_hist(symbol=code, period="daily",
-                     start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq"),
-            lambda: ak.stock_zh_a_daily(symbol=("sh" if code.startswith("6") else "sz") + code,
-                     start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq"),
-        ]:
-            try:
-                df = fn()
-                if df is not None and not df.empty:
-                    if "日期" in df.columns:
-                        df["日期"] = pd.to_datetime(df["日期"])
-                        df = df.sort_values("日期")
-                    return df.tail(days)
-            except Exception:
-                continue
+        code = str(code).zfill(6)
+        df = retry_with_backoff(
+            ak.stock_zh_a_hist,
+            symbol=code, period="daily",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            adjust="qfq",
+        )
+        if df is not None and not df.empty:
+            if "日期" in df.columns:
+                df["日期"] = pd.to_datetime(df["日期"])
+                df = df.sort_values("日期")
+            _kline_fail_count = 0  # 成功清零，避免误熔断
+            return df.tail(days)
     except Exception as e:
-        log(f"⚠ {code} K线失败: {e}", "WARN")
+        log(f"⚠ {code} K线失败: {str(e)[:60]}", "WARN")
+
     _kline_fail_count += 1
     if _kline_fail_count >= KL_INE_FAIL_THRESHOLD:
         _kline_circuit_broken = True
@@ -273,9 +312,11 @@ def get_fund_flow(code: str):
     global _fund_circuit_broken, _fund_fail_count, _fund_fast_fail
     if _fund_circuit_broken or _fund_fast_fail:
         return 0.0, 0.0
+    code = str(code).zfill(6)
     try:
         import akshare as ak
-        df = retry_with_backoff(ak.stock_individual_fund_flow, code)
+        mkt = "sh" if code.startswith(("6", "9")) else "sz"
+        df = retry_with_backoff(ak.stock_individual_fund_flow, stock=code, market=mkt)
         if df is None or df.empty:
             _fund_fail_count += 1
             return 0.0, 0.0
@@ -286,10 +327,11 @@ def get_fund_flow(code: str):
         df = df.sort_values(df.columns[0], ascending=False)
         net_5 = pd.to_numeric(df[col].head(5), errors="coerce").sum()
         net_10 = pd.to_numeric(df[col].head(10), errors="coerce").sum()
-        _fund_fail_count = 0
+        _fund_fail_count = 0  # 成功清零
         return float(net_5), float(net_10)
-    except Exception:
+    except Exception as e:
         _fund_fail_count += 1
+        log(f"⚠ 资金流失败 {code}: {str(e)[:60]}", "WARN")
         if _fund_fail_count >= FUND_FAIL_THRESHOLD:
             _fund_circuit_broken = True
             log(f"🚫 资金流向连续失败{_fund_fail_count}只，已熔断", "WARN")
@@ -643,7 +685,7 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v5.6 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v5.7 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
         min_score = args.min_score if args.min_score is not None else DEFAULT_MIN_SCORE
@@ -691,7 +733,7 @@ def main():
             get_fund_flow(code)
             get_kline(code)
 
-        # 5.5 强制检查熔断（修复：探针3只全失败时确保熔断标志被设置）
+        # 5.5 强制检查熔断（探针 3 只全失败时确保熔断标志被设置）
         if _fund_fail_count >= FUND_FAIL_THRESHOLD and not _fund_circuit_broken:
             _fund_circuit_broken = True
             log(f"🚫 探针后强制熔断资金接口（失败{_fund_fail_count}次）", "WARN")
