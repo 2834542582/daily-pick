@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v5.2
-修复：global声明重复导致的SyntaxError
+每日选股推送 - 主线增强版 v5.3
+修复：global重复/SyntaxError、板块主线段静默消失、熔断降级时机、市值单位、字段适配
 """
 import argparse
 import json
@@ -75,11 +75,11 @@ def _dump_debug(df, label: str):
         os.makedirs("debug", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if isinstance(df, pd.DataFrame):
-            df.head(20).to_csv(f"debug/{label}_{ts}.csv", index=False, encoding="utf-8-sig")
-            log(f"🐞 落盘: debug/{label}_{ts}.csv | shape={df.shape}")
+            df.head(30).to_csv(f"debug/{label}_{ts}.csv", index=False, encoding="utf-8-sig")
+            log(f"🐞 落盘: debug/{label}_{ts}.csv | shape={df.shape} cols={df.columns.tolist()}")
         else:
             with open(f"debug/{label}_{ts}.txt", "w", encoding="utf-8") as f:
-                f.write(f"type={type(df)}\nrepr={repr(df)[:500]}\n")
+                f.write(f"type={type(df)}\nrepr={repr(df)[:1000]}\n")
     except Exception as e:
         log(f"⚠ 落盘失败: {e}", "WARN")
 
@@ -96,6 +96,16 @@ def _to_int(x):
         return int(float(str(x).replace(",", "").strip()))
     except Exception:
         return 1
+
+
+def fmt_mcap(yuan_val):
+    """市值格式化：元 → 亿/万"""
+    y = _to_num(yuan_val)
+    if y >= 1e8:
+        return f"{y/1e8:.1f}亿"
+    elif y >= 1e4:
+        return f"{y/1e4:.0f}万"
+    return f"{y:.0f}元"
 
 
 def parse_ftime(ftime_str):
@@ -169,7 +179,7 @@ def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
         seen, uniq = set(), []
         for d in [today] + _get_recent_trade_dates(10):
             if d not in seen:
-                seen.add(d); uniq.append(d)
+                seen.add(d), uniq.append(d)
         candidates = uniq
         log(f"📡 获取涨停池: 无参回溯，候选 {candidates[:4]}...")
 
@@ -292,52 +302,84 @@ def get_sector_rotation() -> Tuple[pd.DataFrame, str]:
 
     try:
         m = retry_on_failure(ak.stock_market_fund_flow)
-        if m is not None and not m.empty and "今日涨跌幅" in m.columns:
-            market_idx_pct = _to_num(m.iloc[0]["今日涨跌幅"])
+        if m is not None and not m.empty:
+            # 兼容不同版本列名
+            pct_col = None
+            for c in m.columns:
+                if "涨跌幅" in str(c):
+                    pct_col = c
+                    break
+            if pct_col:
+                market_idx_pct = _to_num(m.iloc[0][pct_col])
+                log(f"📊 大盘基准: {market_idx_pct:+.2f}%")
     except Exception as e:
         log(f"⚠ 大盘基准获取失败: {e}", "WARN")
         status = "大盘数据缺失"
 
+    # --- 行业涨幅榜 ---
     try:
         ind = retry_on_failure(ak.stock_board_industry_name_em)
         if ind is not None and not ind.empty:
-            name_col = next((c for c in ind.columns if "名称" in c), ind.columns[0])
-            pct_col = next((c for c in ind.columns if "涨跌幅" in c), None)
-            for _, r in ind.iterrows():
-                rows.append({"板块": str(r[name_col]), "类型": "行业",
-                             "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
-                             "主力净流入": 0.0})
+            _dump_debug(ind, "industry_rank_raw")
+            name_col = None
+            pct_col = None
+            for c in ind.columns:
+                if "名称" in str(c):
+                    name_col = c
+                if "涨跌幅" in str(c):
+                    pct_col = c
+            if name_col:
+                for _, r in ind.iterrows():
+                    rows.append({"板块": str(r[name_col]), "类型": "行业",
+                                 "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
+                                 "主力净流入": 0.0})
+                log(f"✅ 行业涨幅榜: {len(rows)} 个板块")
     except Exception as e:
         log(f"⚠ 行业涨幅榜失败: {e}", "WARN")
         status = "行业涨幅榜失败"
 
+    # --- 行业资金流 ---
     try:
         flow = ak.stock_sector_fund_flow_rank(indicator="5日", sector_type="行业资金流向")
         if flow is not None and not flow.empty:
-            name_col = next((c for c in flow.columns if "名称" in c or "板块" in c), flow.columns[0])
-            net_col = next((c for c in flow.columns if "主力" in c and ("净额" in c or "净流入" in c)), None)
-            pct_col = next((c for c in flow.columns if "涨跌幅" in c), None)
-            for _, r in flow.iterrows():
-                nm = str(r[name_col])
-                net = _to_num(r.get(net_col, 0)) if net_col else 0.0
-                pct = _to_num(r.get(pct_col, 0)) if pct_col else 0.0
-                found = False
-                for row in rows:
-                    if row["板块"] == nm:
-                        row["主力净流入"] = net
-                        if pct_col:
-                            row["5日涨幅"] = pct
-                        found = True
-                        break
-                if not found:
-                    rows.append({"板块": nm, "类型": "行业", "5日涨幅": pct, "主力净流入": net})
+            _dump_debug(flow, "sector_fund_raw")
+            log(f"📊 资金流原始列: {flow.columns.tolist()}")
+            name_col = None
+            net_col = None
+            pct_col = None
+            for c in flow.columns:
+                s = str(c)
+                if "名称" in s or "板块" in s:
+                    name_col = c
+                if "主力" in s and ("净额" in s or "净流入" in s):
+                    net_col = c
+                if "涨跌幅" in s:
+                    pct_col = c
+            log(f"  映射: name={name_col} net={net_col} pct={pct_col}")
+            if name_col:
+                for _, r in flow.iterrows():
+                    nm = str(r[name_col])
+                    net = _to_num(r.get(net_col, 0)) if net_col else 0.0
+                    pct = _to_num(r.get(pct_col, 0)) if pct_col else 0.0
+                    found = False
+                    for row in rows:
+                        if row["板块"] == nm:
+                            row["主力净流入"] = net
+                            if pct_col:
+                                row["5日涨幅"] = pct
+                            found = True
+                            break
+                    if not found:
+                        rows.append({"板块": nm, "类型": "行业", "5日涨幅": pct, "主力净流入": net})
+                log(f"✅ 资金流合并后: {len(rows)} 个板块")
     except Exception as e:
         log(f"⚠ 行业资金流失败: {e}", "WARN")
         if status == "ok":
             status = "资金流接口不可用，仅按涨幅排名"
 
     if not rows:
-        return pd.DataFrame(), "无板块数据"
+        log("⚠ 板块数据完全为空，返回空DataFrame", "WARN")
+        return pd.DataFrame(), status
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["板块"]).copy()
 
@@ -364,6 +406,7 @@ def get_sector_rotation() -> Tuple[pd.DataFrame, str]:
         return "—"
     df["状态"] = df.apply(label, axis=1)
     df = df.sort_values("强度分", ascending=False).reset_index(drop=True)
+    log(f"✅ 板块主线分析完成: {len(df)} 个板块 | status={status}")
     return df, status
 
 
@@ -444,8 +487,8 @@ def score_stock(row, sector_counts, use_fund, use_ma):
             s = weights["return_shot"]; score += s; reasons.append(f"回马枪(+{s})")
 
     mcap = _to_num(row.get("total_market_cap", 0))
-    if 30 <= mcap <= 100:
-        s = weights["market_cap_bonus"]; score += s; reasons.append(f"市值{mcap:.0f}亿(+{s})")
+    if 30 <= mcap / 1e8 <= 100:
+        s = weights["market_cap_bonus"]; score += s; reasons.append(f"市值{fmt_mcap(mcap)}(+{s})")
 
     to = _to_num(row.get("turnover", 0))
     if 5 <= to <= 15:
@@ -477,14 +520,21 @@ def send_wecom_webhook(webhook_url: str, content: str) -> bool:
 
 def format_sector_section(sec_df: pd.DataFrame, status: str) -> str:
     if sec_df is None or sec_df.empty:
-        return ""
+        return "\n### 🌐 板块主线监测\n> ⚠️ 本次未取到板块数据（接口异常或限流），主线判断暂缺\n"
     msg = "\n### 🌐 板块主线监测\n"
     if status and status != "ok":
-        msg += f"> {status}\n"
+        msg += f"> 状态: {status}\n"
     strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(5)
     if not strong.empty:
         msg += "\n**🔥 强势主线**\n"
         for _, r in strong.iterrows():
+            net = r['主力净流入']
+            net_str = f"{net/1e8:+.2f}亿" if abs(net) >= 1e8 else f"{net/1e4:+.0f}万"
+            msg += f"- {r['板块']} | 5日{r['5日涨幅']:+.1f}% | 资金{net_str}\n"
+    warm = sec_df[sec_df["状态"] == "📈升温中"].head(3)
+    if not warm.empty:
+        msg += "\n**📈 升温中**\n"
+        for _, r in warm.iterrows():
             net = r['主力净流入']
             net_str = f"{net/1e8:+.2f}亿" if abs(net) >= 1e8 else f"{net/1e4:+.0f}万"
             msg += f"- {r['板块']} | 5日{r['5日涨幅']:+.1f}% | 资金{net_str}\n"
@@ -502,6 +552,8 @@ def format_sector_section(sec_df: pd.DataFrame, status: str) -> str:
             net = r['主力净流入']
             net_str = f"{net/1e8:+.2f}亿" if abs(net) >= 1e8 else f"{net/1e4:+.0f}万"
             msg += f"- {r['板块']} | 涨但资金{net_str}(量价背离)\n"
+    if strong.empty and warm.empty and weak.empty and pulse.empty:
+        msg += "> 暂无明确主线信号\n"
     return msg
 
 
@@ -521,7 +573,7 @@ def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status, min_scor
         for i, (_, r) in enumerate(df.head(15).iterrows(), 1):
             msg += f"\n**{i}. {r.get('name','')}** (`{r.get('code','')}`)\n"
             msg += f"- 评分:**{r.get('score',0)}** | 板块:{r.get('industry','N/A')} | 连板:{_to_int(r.get('board_count',1))}\n"
-            msg += f"- 换手:{_to_num(r.get('turnover',0)):.1f}% | 市值:{_to_num(r.get('total_market_cap',0)):.0f}亿\n"
+            msg += f"- 换手:{_to_num(r.get('turnover',0)):.1f}% | 市值:{fmt_mcap(r.get('total_market_cap',0))}\n"
             if "reasons" in r and r["reasons"]:
                 msg += f"- 亮点: {'、'.join(r['reasons'][:3])}\n"
 
@@ -552,7 +604,7 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v5.3 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
         min_score = args.min_score if args.min_score is not None else DEFAULT_MIN_SCORE
@@ -560,9 +612,11 @@ def main():
         # 1. 板块主线监测
         log("🌐 板块主线监测...")
         sec_df, sec_status = get_sector_rotation()
+        log(f"🌐 板块数据 rows={len(sec_df)} | status={sec_status}")
         if not sec_df.empty:
             top3_str = ' | '.join(f"{r['板块']}({r['状态']})" for _, r in sec_df.head(3).iterrows())
-            log(f"✅ 板块数据 {len(sec_df)} 个，TOP3: {top3_str}")
+            log(f"✅ 板块TOP3: {top3_str}")
+            _dump_debug(sec_df, "sector_rotation_result")
 
         # 2. 涨停池
         df = get_limit_up_pool(args.date)
@@ -591,15 +645,24 @@ def main():
                               format_message(df, mode, tag, filtered_reasons, sec_df, sec_status, min_score))
             return
 
-        # 5. 自动降级
+        # 5. 探针预检熔断（关键修复：在评分前先探几只触发熔断标志）
+        log("🔬 探针预检接口可用性...")
+        probe = df.head(min(3, len(df)))
+        for _, row in probe.iterrows():
+            code = str(row.get("code", "")).zfill(6)
+            get_fund_flow(code)
+            get_kline(code)
+        log(f"🔬 预检完成: 资金熔断={_fund_circuit_broken} K线熔断={_kline_circuit_broken}")
+
+        # 6. 自动降级判定
         use_fund = not args.no_fund and not _fund_circuit_broken
         use_ma = not args.no_ma and not _kline_circuit_broken
         if (_fund_circuit_broken or _kline_circuit_broken) and args.min_score is None:
             min_score = DEGRADED_MIN_SCORE
             log(f"⚠️ 接口降级，阈值自动从{DEFAULT_MIN_SCORE}调整为{min_score}", "WARN")
 
-        # 6. 评分
-        log(f"📝 开始评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'}）...")
+        # 7. 评分
+        log(f"📝 开始评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'} 阈值={min_score}）...")
         t0 = time.time()
         scores, all_reasons = [], []
         for idx, (_, row) in enumerate(df.iterrows()):
@@ -614,7 +677,7 @@ def main():
         df_f = df[df["score"] >= min_score].sort_values("score", ascending=False).head(args.top)
         log(f"✅ 达标 {len(df_f)} 只 ≥ {min_score}分 ({time.time()-t0:.1f}s)")
 
-        # 7. 落盘
+        # 8. 落盘
         out_dir = os.environ.get("OUTPUT_DIR", "results")
         os.makedirs(out_dir, exist_ok=True)
         if not df_f.empty:
@@ -623,7 +686,7 @@ def main():
                               index=False, encoding="utf-8-sig")
             log(f"💾 已保存 {len(df_f)}只")
 
-        # 8. 推送
+        # 9. 推送
         send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
                           format_message(df_f, mode, tag, filtered_reasons, sec_df, sec_status, min_score))
         log("✅ 选股完成")
