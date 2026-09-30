@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v5.4
-修复：板块主线多源兜底（同花顺→东财→涨停池聚合），解决CI里东财push接口被断连
+每日选股推送 - 主线增强版 v5.5
+修复：涨停池聚合兜底路径缺少「状态」列导致KeyError
 """
 import argparse
 import json
@@ -59,7 +59,6 @@ def log(msg: str, level: str = "INFO"):
 
 
 def retry_with_backoff(func, *args, **kwargs):
-    """指数退避重试，专门对付 RemoteDisconnected"""
     last_error = None
     for i in range(RETRY_COUNT):
         try:
@@ -79,7 +78,7 @@ def _dump_debug(df, label: str):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if isinstance(df, pd.DataFrame):
             df.head(30).to_csv(f"debug/{label}_{ts}.csv", index=False, encoding="utf-8-sig")
-            log(f"🐞 落盘: debug/{label}_{ts}.csv | shape={df.shape} cols={df.columns.tolist()}")
+            log(f"🐞 落盘: debug/{label}_{ts}.csv | shape={df.shape}")
         else:
             with open(f"debug/{label}_{ts}.txt", "w", encoding="utf-8") as f:
                 f.write(f"type={type(df)}\nrepr={repr(df)[:1000]}\n")
@@ -111,7 +110,6 @@ def fmt_mcap(yuan_val):
 
 
 def _find_col(df, *keywords):
-    """在 df.columns 里模糊匹配第一个含有关键词的列"""
     for c in df.columns:
         for kw in keywords:
             if kw in str(c):
@@ -164,7 +162,6 @@ def _normalize(df: pd.DataFrame, used_date: str) -> pd.DataFrame:
         "换手率": "turnover", "封板资金": "seal_amount",
         "首次封板时间": "first_time", "最后封板时间": "last_time",
         "炸板次数": "open_times", "连板数": "board_count", "所属行业": "industry",
-        "首次涨停时间": "first_time", "最后涨停时间": "last_time",
     }
     for old, new in mapping.items():
         if old in df.columns:
@@ -236,7 +233,7 @@ def get_kline(code: str, days: int = 60):
     _kline_fail_count += 1
     if _kline_fail_count >= KL_INE_FAIL_THRESHOLD:
         _kline_circuit_broken = True
-        log(f"🚫 K线连续失败{_kline_fail_count}只，已熔断跳过后续K线请求", "WARN")
+        log(f"🚫 K线连续失败{_kline_fail_count}只，已熔断", "WARN")
     return None
 
 
@@ -293,9 +290,8 @@ def get_fund_flow(code: str):
         return 0.0, 0.0
 
 
-# ==================== 板块主线监测（多源兜底 v5.4）====================
-def _fetch_industry_from_ths() -> Optional[pd.DataFrame]:
-    """同花顺源：CI里比东财稳"""
+# ==================== 板块主线监测 ====================
+def _fetch_industry_from_ths():
     import akshare as ak
     df = retry_with_backoff(ak.stock_board_industry_summary_ths)
     if df is None or df.empty:
@@ -307,18 +303,13 @@ def _fetch_industry_from_ths() -> Optional[pd.DataFrame]:
         return None
     out = []
     for _, r in df.iterrows():
-        out.append({
-            "板块": str(r[name_col]),
-            "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
-            "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0,
-            "来源": "同花顺",
-        })
+        out.append({"板块": str(r[name_col]), "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
+                    "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0, "来源": "同花顺"})
     log(f"✅ 同花顺行业源: {len(out)} 个板块")
     return pd.DataFrame(out)
 
 
-def _fetch_industry_from_em() -> Optional[pd.DataFrame]:
-    """东财源：可能被断连，失败就放弃"""
+def _fetch_industry_from_em():
     import akshare as ak
     df = retry_with_backoff(ak.stock_board_industry_name_em)
     if df is None or df.empty:
@@ -330,18 +321,13 @@ def _fetch_industry_from_em() -> Optional[pd.DataFrame]:
         return None
     out = []
     for _, r in df.iterrows():
-        out.append({
-            "板块": str(r[name_col]),
-            "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
-            "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0,
-            "来源": "东财",
-        })
+        out.append({"板块": str(r[name_col]), "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
+                    "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0, "来源": "东财"})
     log(f"✅ 东财行业源: {len(out)} 个板块")
     return pd.DataFrame(out)
 
 
-def _fetch_fund_flow_rank() -> Optional[pd.DataFrame]:
-    """东财板块资金流排名，参数用对的 '行业资金流'"""
+def _fetch_fund_flow_rank():
     import akshare as ak
     try:
         df = retry_with_backoff(ak.stock_sector_fund_flow_rank, "5日", "行业资金流")
@@ -357,18 +343,14 @@ def _fetch_fund_flow_rank() -> Optional[pd.DataFrame]:
         return None
     out = []
     for _, r in df.iterrows():
-        out.append({
-            "板块": str(r[name_col]),
-            "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
-            "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0,
-            "来源": "东财资金流",
-        })
+        out.append({"板块": str(r[name_col]), "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
+                    "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0, "来源": "东财资金流"})
     log(f"✅ 东财资金流排名: {len(out)} 个板块")
     return pd.DataFrame(out)
 
 
-def _build_from_limitup(zt_df: pd.DataFrame) -> pd.DataFrame:
-    """兜底：用涨停池行业聚合，至少能看出今天资金抱团在哪"""
+def _build_from_limitup(zt_df):
+    """涨停池聚合兜底，直接带状态列"""
     if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
         return pd.DataFrame()
     vc = zt_df["industry"].value_counts()
@@ -376,26 +358,28 @@ def _build_from_limitup(zt_df: pd.DataFrame) -> pd.DataFrame:
     for name, cnt in vc.items():
         if name in (None, "未知", ""):
             continue
-        out.append({
-            "板块": str(name),
-            "5日涨幅": 0.0,
-            "主力净流入": 0.0,
-            "涨停家数": int(cnt),
-            "来源": "涨停池聚合",
-        })
+        # 按涨停家数直接给状态
+        if cnt >= 3:
+            status = "🔥强势主线"
+        elif cnt >= 2:
+            status = "📈升温中"
+        else:
+            status = "—"
+        out.append({"板块": str(name), "5日涨幅": 0.0, "主力净流入": 0.0,
+                    "涨停家数": int(cnt), "来源": "涨停池聚合", "状态": status, "强度分": cnt * 10})
     if not out:
         return pd.DataFrame()
-    df = pd.DataFrame(out).sort_values("涨停家数", ascending=False)
-    log(f"✅ 涨停池聚合主线: {len(df)} 个板块，TOP3: {' | '.join(f'{r.板块}({r.涨停家数})' for r in df.head(3).itertuples())}")
+    df = pd.DataFrame(out).sort_values("涨停家数", ascending=False).reset_index(drop=True)
+    log(f"✅ 涨停池聚合主线: {len(df)} 个板块，TOP3: {' | '.join(f'{r.板块}({r.涨停家数}家)' for r in df.head(3).itertuples())}")
     return df
 
 
-def get_sector_rotation(zt_df: pd.DataFrame = None) -> Tuple[pd.DataFrame, str]:
+def get_sector_rotation(zt_df=None):
     rows = []
     status = "ok"
     seen = set()
 
-    # 1) 同花顺行业概览（首选）
+    # 1) 同花顺
     try:
         d = _fetch_industry_from_ths()
         if d is not None and not d.empty:
@@ -405,7 +389,7 @@ def get_sector_rotation(zt_df: pd.DataFrame = None) -> Tuple[pd.DataFrame, str]:
     except Exception as e:
         log(f"⚠ 同花顺源失败: {e}", "WARN"); status = "同花顺源失败"
 
-    # 2) 东财行业涨幅榜（补充）
+    # 2) 东财
     try:
         d = _fetch_industry_from_em()
         if d is not None and not d.empty:
@@ -414,10 +398,9 @@ def get_sector_rotation(zt_df: pd.DataFrame = None) -> Tuple[pd.DataFrame, str]:
                     seen.add(r["板块"]); rows.append(r.to_dict())
     except Exception as e:
         log(f"⚠ 东财行业榜失败: {e}", "WARN")
-        if status == "ok":
-            status = "东财行业榜失败"
+        if status == "ok": status = "东财行业榜失败"
 
-    # 3) 东财板块资金流排名（合并资金列）
+    # 3) 资金流排名
     try:
         d = _fetch_fund_flow_rank()
         if d is not None and not d.empty:
@@ -433,10 +416,9 @@ def get_sector_rotation(zt_df: pd.DataFrame = None) -> Tuple[pd.DataFrame, str]:
                     seen.add(r["板块"]); rows.append(r.to_dict())
     except Exception as e:
         log(f"⚠ 东财资金流排名失败: {e}", "WARN")
-        if status == "ok":
-            status = "资金流排名不可用"
+        if status == "ok": status = "资金流排名不可用"
 
-    # 4) 兜底：涨停池聚合
+    # 4) 兜底
     if not rows:
         log("⚠ 外部板块源全挂，启用涨停池聚合兜底", "WARN")
         d = _build_from_limitup(zt_df)
@@ -445,53 +427,46 @@ def get_sector_rotation(zt_df: pd.DataFrame = None) -> Tuple[pd.DataFrame, str]:
         return pd.DataFrame(), "全部失败"
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["板块"]).copy()
-
-    # 没有5日真实涨幅时，用涨停家数做热度分
     has_real_pct = df["5日涨幅"].abs().sum() > 0
-    market_idx_pct = 0.0
 
     def calc_strength(r):
-        score = 0
         if has_real_pct:
+            score = 0
             if r["5日涨幅"] >= 5:      score += 30
             elif r["5日涨幅"] >= 2:    score += 20
             elif r["5日涨幅"] >= 0:    score += 10
             if r["主力净流入"] > 0:    score += 30
             elif r["主力净流入"] < 0:  score -= 15
-            excess = r["5日涨幅"] - market_idx_pct
-            if excess >= 3:           score += 20
-            elif excess >= 1:         score += 10
-            elif excess < -1:         score -= 10
+            return score
         else:
-            # 兜底模式：按涨停家数给分
             cnt = r.get("涨停家数", 0)
-            if cnt >= 5:      score += 50
-            elif cnt >= 3:    score += 35
-            elif cnt >= 2:    score += 20
-            else:             score += 10
-        return score
+            if cnt >= 5: return 50
+            elif cnt >= 3: return 35
+            elif cnt >= 2: return 20
+            return 10
 
     df["强度分"] = df.apply(calc_strength, axis=1)
 
     def label(r):
         if not has_real_pct:
             cnt = r.get("涨停家数", 0)
-            if cnt >= 3:
-                return "🔥强势主线"
+            if cnt >= 3: return "🔥强势主线"
+            elif cnt >= 2: return "📈升温中"
             return "—"
-        if r["强度分"] >= 60 and r["主力净流入"] > 0:  return "🔥强势主线"
-        if r["强度分"] >= 40:                          return "📈升温中"
-        if r["强度分"] < 0 and r["主力净流入"] < 0:    return "📉走弱"
-        if r["5日涨幅"] > 3 and r["主力净流入"] < 0:   return "⚠️脉冲"
+        if r["强度分"] >= 60 and r["主力净流入"] > 0: return "🔥强势主线"
+        if r["强度分"] >= 40: return "📈升温中"
+        if r["强度分"] < 0 and r["主力净流入"] < 0: return "📉走弱"
+        if r["5日涨幅"] > 3 and r["主力净流入"] < 0: return "⚠️脉冲"
         return "—"
+
     df["状态"] = df.apply(label, axis=1)
     df = df.sort_values(["强度分", "主力净流入"], ascending=False).reset_index(drop=True)
-    log(f"✅ 板块主线分析完成: {len(df)} 个板块 | status={status} | 真实涨幅={'有' if has_real_pct else '无(兜底)'}")
+    log(f"✅ 板块主线分析完成: {len(df)} 个板块 | status={status}")
     return df, status
 
 
 # ==================== 过滤 & 评分 ====================
-def hard_filter(df: pd.DataFrame):
+def hard_filter(df):
     if df.empty:
         return df, []
     original = len(df)
@@ -578,7 +553,7 @@ def score_stock(row, sector_counts, use_fund, use_ma):
 
 
 # ==================== 企微推送 ====================
-def send_wecom_webhook(webhook_url: str, content: str) -> bool:
+def send_wecom_webhook(webhook_url, content):
     if not webhook_url:
         log("⚠ WECOM_WEBHOOK 未配置", "WARN")
         return False
@@ -598,9 +573,9 @@ def send_wecom_webhook(webhook_url: str, content: str) -> bool:
     return False
 
 
-def format_sector_section(sec_df: pd.DataFrame, status: str) -> str:
+def format_sector_section(sec_df, status):
     if sec_df is None or sec_df.empty:
-        return "\n### 🌐 板块主线监测\n> ⚠️ 本次未取到任何板块数据（含涨停池聚合也失败），主线判断暂缺\n"
+        return "\n### 🌐 板块主线监测\n> ⚠️ 本次未取到任何板块数据，主线判断暂缺\n"
     msg = "\n### 🌐 板块主线监测\n"
     if status and status != "ok":
         msg += f"> 状态: {status}\n"
@@ -608,7 +583,7 @@ def format_sector_section(sec_df: pd.DataFrame, status: str) -> str:
     if not strong.empty:
         msg += "\n**🔥 强势主线 / 涨停抱团**\n"
         for _, r in strong.iterrows():
-            if "涨停家数" in r and r["涨停家数"] > 0 and r.get("主力净流入", 0) == 0:
+            if r.get("涨停家数", 0) > 0 and r.get("主力净流入", 0) == 0:
                 msg += f"- {r['板块']} | 涨停{r['涨停家数']}家（兜底口径）\n"
             else:
                 net = r['主力净流入']
@@ -666,12 +641,12 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v5.4 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v5.5 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
         min_score = args.min_score if args.min_score is not None else DEFAULT_MIN_SCORE
 
-        # 1. 先拉涨停池（板块兜底要用）
+        # 1. 涨停池
         df_raw = get_limit_up_pool(args.date)
         if df_raw.empty:
             send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
@@ -679,16 +654,19 @@ def main():
                 "\n**原因**: 最近交易日涨停池均为空")
             sys.exit(1)
 
-        # 2. 板块主线监测（把涨停池传进去兜底）
+        # 2. 板块主线（传涨停池兜底）
         log("🌐 板块主线监测...")
         sec_df, sec_status = get_sector_rotation(df_raw)
         log(f"🌐 板块数据 rows={len(sec_df)} | status={sec_status}")
         if not sec_df.empty:
-            top3_str = ' | '.join(f"{r['板块']}({r['状态']})" for _, r in sec_df.head(3).iterrows())
-            log(f"✅ 板块TOP3: {top3_str}")
+            top3_parts = []
+            for _, r in sec_df.head(3).iterrows():
+                st = r.get("状态", "—")
+                top3_parts.append(f"{r['板块']}({st})")
+            log(f"✅ 板块TOP3: {' | '.join(top3_parts)}")
             _dump_debug(sec_df, "sector_rotation_result")
 
-        # 3. 板块统计（给评分用）
+        # 3. 板块统计
         sector_counts = {}
         if "industry" in df_raw.columns:
             sector_counts = df_raw["industry"].value_counts().to_dict()
@@ -703,7 +681,7 @@ def main():
                               format_message(df, mode, tag, filtered_reasons, sec_df, sec_status, min_score))
             return
 
-        # 5. 探针预检熔断
+        # 5. 探针预检
         log("🔬 探针预检接口可用性...")
         probe = df.head(min(3, len(df)))
         for _, row in probe.iterrows():
@@ -712,7 +690,7 @@ def main():
             get_kline(code)
         log(f"🔬 预检完成: 资金熔断={_fund_circuit_broken} K线熔断={_kline_circuit_broken}")
 
-        # 6. 自动降级
+        # 6. 降级
         use_fund = not args.no_fund and not _fund_circuit_broken
         use_ma = not args.no_ma and not _kline_circuit_broken
         if (_fund_circuit_broken or _kline_circuit_broken) and args.min_score is None:
