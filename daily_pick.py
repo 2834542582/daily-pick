@@ -22,6 +22,7 @@ def get_trade_date():
     return datetime.datetime.now().strftime("%Y%m%d")
 
 def get_limit_up_pool(date_str):
+    """获取涨停池"""
     try:
         df = ak.stock_zt_pool_em(date=date_str)
         return df
@@ -30,6 +31,7 @@ def get_limit_up_pool(date_str):
         return pd.DataFrame()
 
 def get_unlock_calendar():
+    """获取解禁日历"""
     try:
         df = ak.stock_restricted_release_queue_em()
         return df
@@ -37,30 +39,37 @@ def get_unlock_calendar():
         print(f"⚠️ 解禁接口失败: {e}")
         return pd.DataFrame()
 
-def calc_score(row, unlock_ratio=0):
+def calc_score(row_dict, unlock_ratio=0):
+    """计算综合评分"""
     score = 50
-    turnover = row.get("换手率", 0) or 0
+
+    turnover = float(row_dict.get("换手率", 0) or 0)
     if turnover > 15:
         score += 12
     elif turnover > 8:
         score += 8
     elif turnover > 3:
         score += 4
-    amount = row.get("成交额", 0) or 0
+
+    amount = float(row_dict.get("成交额", 0) or 0)
     if amount > 20e8:
         score += 15
     elif amount > 10e8:
         score += 10
     elif amount > 3e8:
         score += 5
-    change = row.get("涨跌幅", 0) or 0
+
+    change = float(row_dict.get("涨跌幅", 0) or 0)
     if change >= 9.8:
         score += 10
-    circ_mv = row.get("流通市值", 0) or 0
+
+    circ_mv = float(row_dict.get("流通市值", 0) or 0)
     if 20e8 < circ_mv < 100e8:
         score += 8
+
     if unlock_ratio > CFG["unlock_max"]:
         score -= 15
+
     return max(0, min(score, 100))
 
 def pick():
@@ -68,42 +77,49 @@ def pick():
     print(f"\n== 选股日期：{date_str} | 模式：first ==")
 
     zt_df = get_limit_up_pool(date_str)
-    if zt_df.empty:
-        print("📭 涨停池为空（非交易日/接口限流）")
+    if zt_df is None or zt_df.empty:
+        print("📭 涨停池为空（非交易日/接口限流/数据未更新）")
         return pd.DataFrame()
 
     print(f"涨停池 {len(zt_df)} 只")
 
     unlock_df = get_unlock_calendar()
     unlock_set = set()
-    if not unlock_df.empty and "代码" in unlock_df.columns:
+    if unlock_df is not None and not unlock_df.empty:
         try:
-            recent = unlock_df.copy()
-            recent["解禁日期"] = pd.to_datetime(recent.get("解禁日期", ""), errors="coerce")
-            cutoff = pd.Timestamp.now() + pd.Timedelta(days=CFG["unlock_days"])
-            mask = (recent["解禁日期"] <= cutoff) & (recent["解禁日期"] >= pd.Timestamp.now())
-            unlock_set = set(recent.loc[mask, "代码"].astype(str).tolist())
+            unlock_codes = unlock_df["代码"].astype(str).tolist()
+            unlock_set = set(unlock_codes)
+            print(f"🛡️ 解禁池 {len(unlock_set)} 只")
         except Exception as e:
             print(f"⚠️ 解禁数据处理异常: {e}")
-
-    if unlock_set:
-        print(f"🛡️ 解禁风控：{len(unlock_set)} 只处于解禁前{CFG['unlock_days']}天窗口，将剔除")
 
     results = []
     blocked = 0
     miss = 0
 
-    for _, row in zt_df.iterrows():
+    for idx, row in zt_df.iterrows():
         code = str(row.get("代码", "")).zfill(6)
-        name = row.get("名称", "")
+        name = str(row.get("名称", ""))
 
+        # 剔除ST
+        if "ST" in name or "st" in name:
+            blocked += 1
+            continue
+
+        # 解禁剔除
         if code in unlock_set:
             blocked += 1
             continue
 
+        # 拉K线验证
         try:
-            kline = ak.stock_zh_a_hist(symbol=code, period="daily",
-                                        start_date=date_str, end_date=date_str, adjust="qfq")
+            kline = ak.stock_zh_a_hist(
+                symbol=code,
+                period="daily",
+                start_date=date_str,
+                end_date=date_str,
+                adjust="qfq"
+            )
             if kline is None or kline.empty:
                 miss += 1
                 continue
@@ -111,17 +127,25 @@ def pick():
             miss += 1
             continue
 
+        # 解禁比例
         unlock_ratio = 0
-        if not unlock_df.empty:
+        if unlock_df is not None and not unlock_df.empty:
             try:
-                codes = unlock_df.get("代码", pd.Series()).astype(str).tolist()
-                if code in codes:
-                    idx = codes.index(code)
-                    unlock_ratio = float(unlock_df.iloc[idx].get("解禁比例", 0) or 0)
+                mask = unlock_df["代码"].astype(str) == code
+                if mask.any():
+                    unlock_ratio = float(unlock_df.loc[mask, "解禁比例"].values[0] or 0)
             except Exception:
                 pass
 
-        score = calc_score(row, unlock_ratio)
+        # 构造字典传入评分
+        row_dict = {
+            "换手率": row.get("换手率", 0),
+            "成交额": row.get("成交额", 0),
+            "涨跌幅": row.get("涨跌幅", 0),
+            "流通市值": row.get("流通市值", 0),
+        }
+
+        score = calc_score(row_dict, unlock_ratio)
         if score < CFG["min_score"]:
             continue
 
@@ -129,9 +153,9 @@ def pick():
             "代码": code,
             "名称": name,
             "评分": score,
-            "换手率": row.get("换手率", 0),
-            "成交额_亿": round((row.get("成交额", 0) or 0) / 1e8, 1),
-            "涨跌幅": row.get("涨跌幅", 0),
+            "换手率": turnover if 'turnover' in dir() else row_dict["换手率"],
+            "成交额_亿": round(float(row_dict["成交额"]) / 1e8, 1),
+            "涨跌幅": row_dict["涨跌幅"],
         })
 
     print(f"过滤后 {len(results)} 只 | 解禁剔除{blocked} | K线缺失{miss}")
@@ -153,7 +177,7 @@ def push_wecom(df, webhook):
         for _, row in top.iterrows():
             lines.append(
                 f"{row['名称']}({row['代码']}) 评分{row['评分']} | "
-                f"{row.get('换手率', 0):.1f}%换 | {row.get('成交额_亿', 0):.1f}亿"
+                f"{float(row.get('换手率', 0)):.1f}%换 | {float(row.get('成交额_亿', 0)):.1f}亿"
             )
         content = "\n".join(lines)
 
