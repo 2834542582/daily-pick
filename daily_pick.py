@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v5
-修复：资金熔断时自动降级（降阈值+权重再分配）+ K线熔断 + 板块主线监测
+每日选股推送 - 主线增强版 v5.1
+修复：KL_INE_FAIL_THRESHOLD 常量定义 + 海象运算符语法错误 + 熔断状态重置bug
 """
 import argparse
 import json
@@ -25,27 +25,31 @@ MAIN_BOARD_MIN_STOCKS = 3
 RETRY_COUNT = 2
 RETRY_DELAY = 3
 FUND_FAIL_THRESHOLD = 3        # 连续失败N只 → 资金熔断
-KLINE_FAIL_THRESHOLD = 5       # 连续失败N只 → K线熔断
+KL_INE_FAIL_THRESHOLD = 5      # 连续失败N只 → K线熔断（← 这行之前漏了）
 DEFAULT_MIN_SCORE = 75         # 正常阈值
-DEGRADED_MIN_SCORE = 55        # 降级阈值（资金/K线接口挂了时用）
+DEGRADED_MIN_SCORE = 55        # 降级阈值
 
 HARD_FILTERS = {
     "st": True, "max_boards": 3, "max_turnover": 28.0,
     "one_word": True, "min_market_cap": 15.0, "late_afternoon": True,
 }
 
-# 权重分两套：正常版 / 降级版
 WEIGHTS_NORMAL = {
     "board_count": 5, "sector_main": 20, "fund_flow_5d": 15, "fund_flow_10d": 10,
     "morning_lobby": 10, "no_open": 10, "ma_bull": 15, "return_shot": 15,
     "market_cap_bonus": 5, "turnover_good": 5,
 }
-# 资金/K线不可用时，把这40分挪给：板块主线、早盘、未开板、换手、市值
 WEIGHTS_DEGRADED = {
     "board_count": 5, "sector_main": 35, "fund_flow_5d": 0, "fund_flow_10d": 0,
     "morning_lobby": 18, "no_open": 15, "ma_bull": 0, "return_shot": 0,
     "market_cap_bonus": 12, "turnover_good": 15,
 }
+
+# ==================== 全局熔断状态 ====================
+_fund_circuit_broken = False
+_fund_fail_count = 0
+_kline_circuit_broken = False
+_kline_fail_count = 0
 
 
 # ==================== 基础工具 ====================
@@ -72,7 +76,7 @@ def _dump_debug(df, label: str):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if isinstance(df, pd.DataFrame):
             df.head(20).to_csv(f"debug/{label}_{ts}.csv", index=False, encoding="utf-8-sig")
-            log(f"🐞 落盘: debug/{label}_{ts}.csv | shape={df.shape} | cols={df.columns.tolist()}")
+            log(f"🐞 落盘: debug/{label}_{ts}.csv | shape={df.shape}")
         else:
             with open(f"debug/{label}_{ts}.txt", "w", encoding="utf-8") as f:
                 f.write(f"type={type(df)}\nrepr={repr(df)[:500]}\n")
@@ -116,7 +120,7 @@ def is_late_afternoon(ftime_str) -> bool:
     return dt > datetime(dt.year, dt.month, dt.day, 14, 30)
 
 
-# ==================== 涨停池（带回溯）====================
+# ==================== 涨停池 ====================
 def _get_recent_trade_dates(n: int = 10) -> List[str]:
     try:
         import akshare as ak
@@ -176,26 +180,19 @@ def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
             log(f"⚠ {cand} 接口异常: {e}", "WARN")
             _dump_debug(pd.DataFrame(), f"ztpool_error_{cand}")
             continue
-        if df is None:
-            log(f"⚠ {cand} 返回None", "WARN"); _dump_debug(pd.DataFrame(), f"ztpool_none_{cand}"); continue
-        if not isinstance(df, pd.DataFrame):
-            log(f"⚠ {cand} 类型异常{type(df)}", "WARN"); _dump_debug(df, f"ztpool_type_{cand}"); continue
-        if df.empty:
-            log(f"⚠ {cand} 空表", "WARN"); _dump_debug(df, f"ztpool_empty_{cand}"); continue
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            log(f"⚠ {cand} 无数据", "WARN")
+            _dump_debug(df if isinstance(df, pd.DataFrame) else pd.DataFrame(), f"ztpool_empty_{cand}")
+            continue
         log(f"✅ 涨停池命中 {cand}: {len(df)} 只")
         _dump_debug(df, f"ztpool_ok_{cand}")
         return _normalize(df.copy(), cand)
 
     log("❌ 最近交易日均无可涨停数据", "ERROR")
-    _dump_debug(pd.DataFrame(), "ztpool_all_failed")
     return pd.DataFrame()
 
 
-# ==================== 形态判断（带熔断）====================
-_kline_circuit_broken = False
-_kline_fail_count = 0
-
-
+# ==================== K线（带熔断）====================
 def get_kline(code: str, days: int = 60):
     global _kline_circuit_broken, _kline_fail_count
     if _kline_circuit_broken:
@@ -222,15 +219,10 @@ def get_kline(code: str, days: int = 60):
     except Exception as e:
         log(f"⚠ {code} K线失败: {e}", "WARN")
     _kline_fail_count += 1
-    if _kline_fail_count >= KL_INE_FAIL_THRESHOLD := KL_INE_FAIL_THRESHOLD:
+    if _kline_fail_count >= KL_INE_FAIL_THRESHOLD:
         _kline_circuit_broken = True
         log(f"🚫 K线连续失败{_kline_fail_count}只，已熔断跳过后续K线请求", "WARN")
     return None
-
-
-# 修正：用固定常量
-_kline_fail_count = 0
-_kline_circuit_broken = False
 
 
 def check_ma_bull(df):
@@ -259,10 +251,6 @@ def check_return_shot(df):
 
 
 # ==================== 资金流向（带熔断）====================
-_fund_circuit_broken = False
-_fund_fail_count = 0
-
-
 def get_fund_flow(code: str):
     global _fund_circuit_broken, _fund_fail_count
     if _fund_circuit_broken:
@@ -290,6 +278,7 @@ def get_fund_flow(code: str):
     except Exception:
         _fund_fail_count += 1
         if _fund_fail_count >= FUND_FAIL_THRESHOLD:
+            global _fund_circuit_broken
             _fund_circuit_broken = True
             log(f"🚫 资金流向连续失败{_fund_fail_count}只，已熔断", "WARN")
         return 0.0, 0.0
@@ -297,27 +286,20 @@ def get_fund_flow(code: str):
 
 # ==================== 板块主线监测 ====================
 def get_sector_rotation() -> Tuple[pd.DataFrame, str]:
-    """
-    返回板块主线 DataFrame + 状态说明。
-    列: 板块 | 5日涨幅 | 5日主力净流入 | 强度分 | 状态
-    状态: 强势主线 / 升温中 / 走弱 / 脉冲
-    """
     import akshare as ak
     rows = []
     market_idx_pct = 0.0
     status = "ok"
 
     try:
-        # 大盘基准
         m = retry_on_failure(ak.stock_market_fund_flow)
         if m is not None and not m.empty and "今日涨跌幅" in m.columns:
             market_idx_pct = _to_num(m.iloc[0]["今日涨跌幅"])
     except Exception as e:
         log(f"⚠ 大盘基准获取失败: {e}", "WARN")
-        status = "大盘数据缺失，相对强度未计算"
+        status = "大盘数据缺失"
 
     try:
-        # 行业涨幅榜
         ind = retry_on_failure(ak.stock_board_industry_name_em)
         if ind is not None and not ind.empty:
             name_col = next((c for c in ind.columns if "名称" in c), ind.columns[0])
@@ -331,7 +313,6 @@ def get_sector_rotation() -> Tuple[pd.DataFrame, str]:
         status = "行业涨幅榜失败"
 
     try:
-        # 行业资金流（5日）
         flow = ak.stock_sector_fund_flow_rank(indicator="5日", sector_type="行业资金流向")
         if flow is not None and not flow.empty:
             name_col = next((c for c in flow.columns if "名称" in c or "板块" in c), flow.columns[0])
@@ -341,7 +322,6 @@ def get_sector_rotation() -> Tuple[pd.DataFrame, str]:
                 nm = str(r[name_col])
                 net = _to_num(r.get(net_col, 0)) if net_col else 0.0
                 pct = _to_num(r.get(pct_col, 0)) if pct_col else 0.0
-                # 合并到 rows
                 found = False
                 for row in rows:
                     if row["板块"] == nm:
@@ -354,23 +334,21 @@ def get_sector_rotation() -> Tuple[pd.DataFrame, str]:
                     rows.append({"板块": nm, "类型": "行业", "5日涨幅": pct, "主力净流入": net})
     except Exception as e:
         log(f"⚠ 行业资金流失败: {e}", "WARN")
-        status = "资金流接口不可用，仅按涨幅排名"
+        if status == "ok":
+            status = "资金流接口不可用，仅按涨幅排名"
 
     if not rows:
         return pd.DataFrame(), "无板块数据"
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["板块"]).copy()
 
-    # 计算强度分
     def calc_strength(r):
         score = 0
         if r["5日涨幅"] >= 5:      score += 30
         elif r["5日涨幅"] >= 2:    score += 20
         elif r["5日涨幅"] >= 0:    score += 10
-        else:                     score += 0
         if r["主力净流入"] > 0:    score += 30
         elif r["主力净流入"] < 0:  score -= 15
-        # 相对大盘
         excess = r["5日涨幅"] - market_idx_pct
         if excess >= 3:           score += 20
         elif excess >= 1:         score += 10
@@ -502,25 +480,32 @@ def format_sector_section(sec_df: pd.DataFrame, status: str) -> str:
     if sec_df is None or sec_df.empty:
         return ""
     msg = "\n### 🌐 板块主线监测\n"
-    if status:
+    if status and status != "ok":
         msg += f"> {status}\n"
-    # 强势主线
     strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(5)
     if not strong.empty:
         msg += "\n**🔥 强势主线**\n"
         for _, r in strong.iterrows():
-            msg += f"- {r['板块']} | 5日{r['5日涨幅']:+.1f}% | 资金{r['主力净流入']/1e8:+.2f}亿\n"
-    # 走弱
+            net = r['主力净流入']
+            if abs(net) >= 1e8:
+                net_str = f"{net/1e8:+.2f}亿"
+            else:
+                net_str = f"{net/1e4:+.0f}万"
+            msg += f"- {r['板块']} | 5日{r['5日涨幅']:+.1f}% | 资金{net_str}\n"
     weak = sec_df[sec_df["状态"] == "📉走弱"].head(3)
     if not weak.empty:
         msg += "\n**📉 转弱方向**\n"
         for _, r in weak.iterrows():
-            msg += f"- {r['板块']} | 5日{r['5日涨幅']:+.1f}% | 资金{r['主力净流入']/1e8:+.2f}亿\n"
+            net = r['主力净流入']
+            net_str = f"{net/1e8:+.2f}亿" if abs(net) >= 1e8 else f"{net/1e4:+.0f}万"
+            msg += f"- {r['板块']} | 5日{r['5日涨幅']:+.1f}% | 资金{net_str}\n"
     pulse = sec_df[sec_df["状态"] == "⚠️脉冲"].head(3)
     if not pulse.empty:
         msg += "\n**⚠️ 脉冲（不追）**\n"
         for _, r in pulse.iterrows():
-            msg += f"- {r['板块']} | 涨但资金{r['主力净流入']/1e8:+.2f}亿(量价背离)\n"
+            net = r['主力净流入']
+            net_str = f"{net/1e8:+.2f}亿" if abs(net) >= 1e8 else f"{net/1e4:+.0f}万"
+            msg += f"- {r['板块']} | 涨但资金{net_str}(量价背离)\n"
     return msg
 
 
@@ -560,7 +545,7 @@ def main():
     p.add_argument("--no-fund", action="store_true")
     p.add_argument("--top", type=int, default=DEFAULT_TOP_N)
     p.add_argument("--date", type=str, default="")
-    p.add_argument("--min-score", type=int, default=None, help="手动指定阈值，不指定则自动")
+    p.add_argument("--min-score", type=int, default=None)
     args = p.parse_args()
 
     if args.no_ma and args.no_fund:
@@ -576,16 +561,14 @@ def main():
     log(f"🚀 启动 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
-        import urllib.request
-
-        # 阈值自动决策
         min_score = args.min_score if args.min_score is not None else DEFAULT_MIN_SCORE
 
-        # 1. 板块主线监测（先做，不受个股接口影响）
+        # 1. 板块主线监测
         log("🌐 板块主线监测...")
         sec_df, sec_status = get_sector_rotation()
         if not sec_df.empty:
-            log(f"✅ 板块数据 {len(sec_df)} 个，TOP3: {' | '.join(f\"{r['板块']}({r['状态']})\" for _, r in sec_df.head(3).iterrows())}")
+            top3_str = ' | '.join(f"{r['板块']}({r['状态']})" for _, r in sec_df.head(3).iterrows())
+            log(f"✅ 板块数据 {len(sec_df)} 个，TOP3: {top3_str}")
 
         # 2. 涨停池
         df = get_limit_up_pool(args.date)
@@ -593,7 +576,7 @@ def main():
             log("❌ 无涨停数据", "ERROR")
             send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
                 "## ⚠️ 选股未执行\n**时间**: " + datetime.now().strftime("%Y-%m-%d %H:%M") +
-                "\n**原因**: 最近交易日涨停池均为空\n**处理**: 已落盘debug/，请查Actions日志")
+                "\n**原因**: 最近交易日涨停池均为空")
             sys.exit(1)
 
         # 3. 板块统计
@@ -614,16 +597,12 @@ def main():
                               format_message(df, mode, tag, filtered_reasons, sec_df, sec_status, min_score))
             return
 
-        # 5. 自动降级判断
+        # 5. 自动降级
         use_fund = not args.no_fund and not _fund_circuit_broken
         use_ma = not args.no_ma and not _kline_circuit_broken
         if (_fund_circuit_broken or _kline_circuit_broken) and args.min_score is None:
             min_score = DEGRADED_MIN_SCORE
             log(f"⚠️ 接口降级，阈值自动从{DEFAULT_MIN_SCORE}调整为{min_score}", "WARN")
-            if _fund_circuit_broken:
-                log("   → 资金维度权重已挪给：板块主线/早盘/未开板/换手/市值", "WARN")
-            if _kline_circuit_broken:
-                log("   → 均线/回马枪维度已关闭", "WARN")
 
         # 6. 评分
         log(f"📝 开始评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'}）...")
