@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v3
-功能：涨停池(带日期回溯) → 板块主线聚类 → 主力资金验证 → 形态过滤 → 企微推送
-支持模式：fast / full / no_fund / keepalive
+每日选股推送 - 主线增强版 v4
+修复：资金流向熔断 + 单只超时 + 优雅降级
 """
 import argparse
 import json
@@ -26,6 +25,9 @@ MIN_MARKET_CAP = 15.0
 MAIN_BOARD_MIN_STOCKS = 3
 RETRY_COUNT = 2
 RETRY_DELAY = 3
+
+# 资金流向熔断：连续失败 N 只后全局跳过
+FUND_FAIL_THRESHOLD = 3
 
 HARD_FILTERS = {
     "st": True,
@@ -79,7 +81,6 @@ def _dump_debug(df, label: str):
         else:
             with open(f"debug/{label}_{ts}.txt", "w", encoding="utf-8") as f:
                 f.write(f"type={type(df)}\nrepr={repr(df)[:500]}\n")
-            log(f"🐞 调试落盘: debug/{label}_{ts}.txt | type={type(df)}")
     except Exception as e:
         log(f"⚠ 调试落盘失败: {e}", "WARN")
 
@@ -137,7 +138,6 @@ def _get_recent_trade_dates(n: int = 10) -> List[str]:
 
 
 def _normalize(df: pd.DataFrame, used_date: str) -> pd.DataFrame:
-    """字段标准化 + 数值化"""
     mapping = {
         "代码": "code", "名称": "name", "涨跌幅": "pct_change", "最新价": "price",
         "成交额": "amount", "流通市值": "circ_market_cap", "总市值": "total_market_cap",
@@ -254,22 +254,50 @@ def check_return_shot(df):
         return False
 
 
-# ==================== 资金流向 ====================
+# ==================== 资金流向（带熔断）====================
+_fund_circuit_broken = False  # 全局熔断标志
+_fund_fail_count = 0
+
+
 def get_fund_flow(code: str):
+    global _fund_circuit_broken, _fund_fail_count
+
+    if _fund_circuit_broken:
+        return 0.0, 0.0
+
     try:
         import akshare as ak
-        df = retry_on_failure(ak.stock_individual_fund_flow, stock=code)
+        # 单次请求，不重试，快速失败
+        df = ak.stock_individual_fund_flow(stock=code)
         if df is None or df.empty:
+            _fund_fail_count += 1
             return 0.0, 0.0
-        if "主力净流入" in df.columns:
-            df = df.sort_values(df.columns[0] if "日期" not in df.columns else "日期", ascending=False)
-            col = "主力净流入"
-            net_5 = pd.to_numeric(df[col].head(5), errors="coerce").sum()
-            net_10 = pd.to_numeric(df[col].head(10), errors="coerce").sum()
-            return float(net_5), float(net_10)
+
+        col = "主力净流入"
+        if col not in df.columns:
+            # 尝试找类似列
+            for c in df.columns:
+                if "主力" in str(c) and "净" in str(c):
+                    col = c
+                    break
+            else:
+                _fund_fail_count += 1
+                return 0.0, 0.0
+
+        df = df.sort_values(df.columns[0], ascending=False)
+        net_5 = pd.to_numeric(df[col].head(5), errors="coerce").sum()
+        net_10 = pd.to_numeric(df[col].head(10), errors="coerce").sum()
+
+        # 成功一只，重置失败计数
+        _fund_fail_count = 0
+        return float(net_5), float(net_10)
+
     except Exception as e:
-        log(f"⚠ {code} 资金流向失败: {e}", "WARN")
-    return 0.0, 0.0
+        _fund_fail_count += 1
+        if _fund_fail_count >= FUND_FAIL_THRESHOLD:
+            _fund_circuit_broken = True
+            log(f"🚫 资金流向连续失败{_fund_fail_count}只，已熔断跳过后续所有资金请求", "WARN")
+        return 0.0, 0.0
 
 
 # ==================== 过滤 & 评分 ====================
@@ -279,39 +307,33 @@ def hard_filter(df: pd.DataFrame):
     original = len(df)
     reasons = []
 
-    # ST
     if HARD_FILTERS["st"] and "name" in df.columns:
         mask = df["name"].astype(str).str.contains("ST|退", case=False, na=False)
         if mask.any():
             reasons.append(f"ST/退市: {mask.sum()}只"); df = df[~mask]
 
-    # 连板>3
     if "board_count" in df.columns:
         mask = df["board_count"] > HARD_FILTERS["max_boards"]
         if mask.any():
             reasons.append(f"连板>3: {mask.sum()}只"); df = df[~mask]
 
-    # 换手>28%
     if "turnover" in df.columns:
         mask = df["turnover"] > HARD_FILTERS["max_turnover"]
         if mask.any():
             reasons.append(f"换手>28%: {mask.sum()}只"); df = df[~mask]
 
-    # 一字板（封单金额/流通市值 > 8% 视为买不进）
     if HARD_FILTERS["one_word"] and "seal_amount" in df.columns and "circ_market_cap" in df.columns:
         circ = df["circ_market_cap"].replace(0, np.nan)
         ratio = df["seal_amount"] / (circ * 1e8)
         mask = (df["open_times"].fillna(99) == 0) & (ratio > 0.08)
         if mask.any():
-            reasons.append(f"一字板(封单过重): {mask.sum()}只"); df = df[~mask]
+            reasons.append(f"一字板: {mask.sum()}只"); df = df[~mask]
 
-    # 市值<15亿
     if "total_market_cap" in df.columns:
         mask = df["total_market_cap"] < HARD_FILTERS["min_market_cap"]
         if mask.any():
             reasons.append(f"市值<15亿: {mask.sum()}只"); df = df[~mask]
 
-    # 尾盘偷袭
     if HARD_FILTERS["late_afternoon"] and "first_time" in df.columns:
         mask = df["first_time"].apply(lambda x: is_late_afternoon(x))
         if mask.any():
@@ -325,19 +347,16 @@ def score_stock(row, sector_counts, use_fund=True, use_ma=False):
     score = 0
     reasons = []
 
-    # 连板
     bc = _to_int(row.get("board_count", 1))
     if bc >= 2:
         s = min(bc * SCORE_WEIGHTS["board_count"], 15)
         score += s; reasons.append(f"连板{bc}层(+{s})")
 
-    # 主线
     ind = str(row.get("industry", "未知"))
     if sector_counts.get(ind, 0) >= MAIN_BOARD_MIN_STOCKS:
         score += SCORE_WEIGHTS["sector_main"]
         reasons.append(f"主线({ind}{sector_counts[ind]}家)(+{SCORE_WEIGHTS['sector_main']})")
 
-    # 资金
     if use_fund:
         n5, n10 = get_fund_flow(str(row.get("code", "")).zfill(6))
         if n5 > 0:
@@ -347,17 +366,14 @@ def score_stock(row, sector_counts, use_fund=True, use_ma=False):
             s = min(int(n10 / 2000), SCORE_WEIGHTS["fund_flow_10d"])
             score += s; reasons.append(f"10日+{n10:.0f}万(+{s})")
 
-    # 早盘
     ft = parse_ftime(row.get("first_time"))
     if ft and ft.hour < 10:
         score += SCORE_WEIGHTS["morning_lobby"]
         reasons.append(f"早盘{ft.strftime('%H:%M')}(+{SCORE_WEIGHTS['morning_lobby']})")
 
-    # 未开板
     if _to_int(row.get("open_times", 1)) == 0:
         score += SCORE_WEIGHTS["no_open"]; reasons.append("未开板(+10)")
 
-    # 均线
     if use_ma:
         kl = get_kline(str(row.get("code", "")).zfill(6))
         if check_ma_bull(kl):
@@ -365,12 +381,10 @@ def score_stock(row, sector_counts, use_fund=True, use_ma=False):
         if check_return_shot(kl):
             score += SCORE_WEIGHTS["return_shot"]; reasons.append("回马枪(+15)")
 
-    # 市值
     mcap = _to_num(row.get("total_market_cap", 0))
     if 30 <= mcap <= 100:
         score += SCORE_WEIGHTS["market_cap_bonus"]; reasons.append(f"市值{mcap:.0f}亿(+5)")
 
-    # 换手
     to = _to_num(row.get("turnover", 0))
     if 5 <= to <= 15:
         score += SCORE_WEIGHTS["turnover_good"]; reasons.append(f"换手{to:.1f}%健康(+5)")
@@ -384,6 +398,7 @@ def send_wecom_webhook(webhook_url: str, content: str) -> bool:
         log("⚠ WECOM_WEBHOOK 未配置", "WARN")
         return False
     try:
+        import urllib.request
         req = urllib.request.Request(
             webhook_url,
             data=json.dumps({"msgtype": "markdown", "markdown": {"content": content}}).encode("utf-8"),
@@ -398,12 +413,14 @@ def send_wecom_webhook(webhook_url: str, content: str) -> bool:
     return False
 
 
-def format_message(df, mode, tag, filtered_reasons):
+def format_message(df, mode, tag, filtered_reasons, fund_broken=False):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     used = df.attrs.get("used_date", "") if hasattr(df, "attrs") else ""
     used_line = f" | 数据日:{used}" if used else ""
 
     msg = f"## 📈 每日选股推送 - {tag}\n**时间**: {now}{used_line}\n**模式**: {mode}\n"
+    if fund_broken:
+        msg += "⚠️ *资金流向接口熔断(上游限流)，已跳过资金加分*\n"
     msg += f"**结果**: {len(df)}只 (评分≥{MIN_SCORE})\n\n### 🏆 候选标的\n"
 
     if df.empty:
@@ -426,6 +443,8 @@ def format_message(df, mode, tag, filtered_reasons):
 
 # ==================== 主流程 ====================
 def main():
+    global _fund_circuit_broken
+
     p = argparse.ArgumentParser(description="每日选股推送")
     p.add_argument("--no-ma", action="store_true", help="跳过均线/回马枪(加速)")
     p.add_argument("--no-fund", action="store_true", help="跳过资金流向")
@@ -447,7 +466,7 @@ def main():
     log(f"🚀 启动 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
-        import urllib.request  # 推送依赖
+        import urllib.request
 
         df = get_limit_up_pool(args.date)
         if df.empty:
@@ -477,10 +496,14 @@ def main():
 
         # 评分
         log(f"📝 开始评分 {len(df)} 只...")
+        t0 = time.time()
         scores, all_reasons = [], []
-        for _, row in df.iterrows():
+        for idx, (_, row) in enumerate(df.iterrows()):
             s, rs = score_stock(row, sector_counts, use_fund=not args.no_fund, use_ma=not args.no_ma)
             scores.append(s); all_reasons.append(rs)
+            if (idx + 1) % 10 == 0:
+                elapsed = time.time() - t0
+                log(f"  ⏳ 已评分 {idx+1}/{len(df)} 只 ({elapsed:.1f}s)")
 
         df = df.copy()
         df["score"] = scores
@@ -488,7 +511,7 @@ def main():
 
         # 过滤+排序+取前N
         df_f = df[df["score"] >= args.min_score].sort_values("score", ascending=False).head(args.top)
-        log(f"✅ 达标 {len(df_f)} 只 ≥ {args.min_score}分")
+        log(f"✅ 达标 {len(df_f)} 只 ≥ {args.min_score}分 (耗时{time.time()-t0:.1f}s)")
 
         # 落盘
         out_dir = os.environ.get("OUTPUT_DIR", "results")
@@ -501,7 +524,8 @@ def main():
 
         # 推送
         send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
-                          format_message(df_f, mode, tag, filtered_reasons))
+                          format_message(df_f, mode, tag, filtered_reasons,
+                                        fund_broken=_fund_circuit_broken))
 
         log("✅ 选股完成")
 
