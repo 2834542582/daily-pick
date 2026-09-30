@@ -7,15 +7,15 @@ import urllib.request
 import time
 import pandas as pd
 import numpy as np
-import akshare as ak
 
 CFG = {
     "date": None,
     "top_n": 15,
-    "min_score": 65,              # 再提一点
+    "min_score": 75,
     "max_board_days": 3,
     "max_turnover": 28.0,
     "fengban_ratio": 0.05,
+    "min_circ_mv": 15e8,
 }
 
 def get_trade_date():
@@ -35,9 +35,119 @@ def _to_int(x):
     except Exception:
         return 1
 
+def is_morning_zt(v):
+    """判断是否为早盘封板（10:30前）。接口返回 '093114' 或 '09:31:14'"""
+    s = str(v).strip()
+    if not s or s in ("—", "nan", "None", "0"):
+        return False, ""
+    if s.isdigit() and len(s) == 6:
+        hh, mm = int(s[:2]), int(s[2:4])
+        return (hh < 10) or (hh == 10 and mm <= 30), f"{s[:2]}:{s[2:4]}:{s[4:]}"
+    if ":" in s:
+        try:
+            t = datetime.datetime.strptime(s[:8], "%H:%M:%S")
+            return t.hour < 10 or (t.hour == 10 and t.minute <= 30), s[:8]
+        except Exception:
+            pass
+    return False, s
+
+def calc_score(d):
+    """综合评分：基础分20 + 各项加权，区间[0,100]"""
+    score = 20
+
+    # 换手率：6-12最佳，>25扣分
+    t = _to_num(d.get("换手率", 0))
+    if 6 <= t <= 12:
+        score += 18
+    elif 12 < t <= 18:
+        score += 12
+    elif 18 < t <= 25:
+        score += 4
+    else:
+        score -= 15
+
+    # 成交额：>=15亿最优
+    a = _to_num(d.get("成交额", 0))
+    if a >= 15e8:
+        score += 14
+    elif a >= 8e8:
+        score += 10
+    elif a >= 4e8:
+        score += 6
+    elif a >= 1.5e8:
+        score += 3
+    else:
+        score -= 10
+
+    # 流通市值：30-120亿最佳弹性
+    c = _to_num(d.get("流通市值", 0))
+    if 30e8 <= c <= 120e8:
+        score += 14
+    elif 120e8 < c <= 250e8:
+        score += 7
+    elif c > 250e8:
+        score += 2
+
+    # 涨跌幅：20cm加分
+    ch = _to_num(d.get("涨跌幅", 0))
+    if ch >= 19.9:
+        score += 8
+    elif ch >= 9.9:
+        score += 4
+
+    # 连板：首板最优，高位扣分
+    lb = _to_int(d.get("连板数", 1))
+    if lb == 1:
+        score += 10
+    elif lb == 2:
+        score += 4
+    else:
+        score -= 10
+
+    # 早盘封板
+    m, _ = is_morning_zt(d.get("首次封板时间", ""))
+    if m:
+        score += 10
+    else:
+        score -= 15
+
+    # 炸板次数
+    zha = _to_int(d.get("炸板次数", 0))
+    if zha == 0:
+        score += 8
+    elif zha == 1:
+        score += 3
+    elif zha == 2:
+        score -= 5
+    else:
+        score -= 15
+
+    return max(0, min(score, 100))
+
+def hard_filter(row):
+    """硬过滤：不满足直接剔除。返回 (是否通过, 原因)"""
+    name = str(row.get("名称", ""))
+    if "ST" in name.upper():
+        return False, "ST"
+    if _to_int(row.get("连板数", 1)) > CFG["max_board_days"]:
+        return False, f"连板>3"
+    if _to_num(row.get("换手率", 0)) > CFG["max_turnover"]:
+        return False, "换手过高"
+    circ = max(_to_num(row.get("流通市值", 0)), 1)
+    if circ > 0 and _to_num(row.get("封板资金", 0)) / circ > CFG["fengban_ratio"]:
+        return False, "一字板"
+    if _to_num(row.get("流通市值", 0)) < CFG["min_circ_mv"]:
+        return False, "市值过小"
+    # 尾盘板+多次炸板：剔除
+    m, _ = is_morning_zt(row.get("首次封板时间", ""))
+    if not m and _to_int(row.get("炸板次数", 0)) >= 2:
+        return False, "尾盘偷袭"
+    return True, ""
+
 def get_limit_up_pool(date_str):
     for attempt in range(3):
         try:
+            import akshare as ak
             df = ak.stock_zt_pool_em(date=date_str)
             if df is not None and not df.empty:
                 return df
@@ -51,6 +161,7 @@ def get_limit_up_pool(date_str):
 def load_unlock_set():
     for attempt in range(2):
         try:
+            import akshare as ak
             df = ak.stock_restricted_release_queue_em()
             if df is not None and not df.empty:
                 code_col = next((c for c in df.columns if "代码" in c or "code" in c.lower()), df.columns[0])
@@ -61,102 +172,13 @@ def load_unlock_set():
             time.sleep(3)
     return set()
 
-def is_morning_zt(fengban_time_val):
-    """
-    判断是否为早盘封板。
-    接口返回格式可能是 093114（int）或 '09:31:14'（str）
-    """
-    s = str(fengban_time_val).strip()
-    if not s or s in ("—", "nan", "None", "0"):
-        return False, ""
-    # 6位数字格式：093114
-    if s.isdigit() and len(s) == 6:
-        hh = int(s[:2])
-        mm = int(s[2:4])
-        display = f"{s[:2]}:{s[2:4]}:{s[4:]}"
-        return (hh < 10) or (hh == 10 and mm <= 30), display
-    # 字符串格式：09:31:14
-    if ":" in s:
-        try:
-            t = datetime.datetime.strptime(s[:8], "%H:%M:%S")
-            display = s[:8]
-            return t.hour < 10 or (t.hour == 10 and t.minute <= 30), display
-        except Exception:
-            pass
-    return False, s
-
-def calc_score(row_dict):
-    score = 35  # 基础分略降
-
-    # 换手率
-    turnover = _to_num(row_dict.get("换手率", 0))
-    if 5 <= turnover <= 12:
-        score += 22
-    elif 12 < turnover <= 18:
-        score += 14
-    elif 18 < turnover <= CFG["max_turnover"]:
-        score += 6
-    elif turnover > CFG["max_turnover"]:
-        score -= 15
-
-    # 成交额
-    amount = _to_num(row_dict.get("成交额", 0))
-    if amount >= 15e8:
-        score += 16
-    elif amount >= 8e8:
-        score += 12
-    elif amount >= 3e8:
-        score += 6
-
-    # 流通市值
-    circ_mv = _to_num(row_dict.get("流通市值", 0))
-    if 30e8 <= circ_mv <= 150e8:
-        score += 16
-    elif 150e8 < circ_mv <= 300e8:
-        score += 8
-    elif circ_mv > 300e8:
-        score += 3
-
-    # 涨跌幅（20cm加分）
-    change = _to_num(row_dict.get("涨跌幅", 0))
-    if change >= 19.9:
-        score += 12
-    elif change >= 9.9:
-        score += 6
-
-    # 连板天数（首板加分，高位减分）
-    lb_days = _to_int(row_dict.get("连板数", 1))
-    if lb_days == 1:
-        score += 12
-    elif lb_days == 2:
-        score += 6
-    elif lb_days == 3:
-        score += 2
-    # 4板以上已经在硬过滤踢掉了
-
-    # 早盘封板
-    is_morning, _ = is_morning_zt(row_dict.get("首次封板时间", ""))
-    if is_morning:
-        score += 12
-
-    # 炸板次数（越少越好）
-    zha_count = _to_int(row_dict.get("炸板次数", 0))
-    if zha_count == 0:
-        score += 8
-    elif zha_count == 1:
-        score += 3
-    elif zha_count >= 3:
-        score -= 10
-
-    return max(0, min(score, 100))
-
 def pick():
     date_str = get_trade_date()
     print(f"\n== 选股日期：{date_str} | 模式：first ==")
 
     zt_df = get_limit_up_pool(date_str)
     if zt_df is None or zt_df.empty:
-        print("📭 涨停池为空")
+        print("📭 涨停池为空（非交易日/接口持续失败）")
         return pd.DataFrame()
     print(f"涨停池 {len(zt_df)} 只")
 
@@ -169,78 +191,51 @@ def pick():
     cols = zt_df.columns.tolist()
     print(f"可用字段: {cols}")
 
-    results = []
-    blocked = 0
-    reason = {"连板过高": 0, "换手过高": 0, "一字板": 0, "ST": 0, "解禁": 0}
+    results, blocked = [], 0
+    reason = {"ST": 0, "连板过高": 0, "换手过高": 0, "一字板": 0,
+              "市值过小": 0, "尾盘偷袭": 0, "解禁": 0}
 
     for _, row in zt_df.iterrows():
         code = str(row.get("代码", "")).zfill(6)
         name = str(row.get("名称", ""))
 
-        # ST 剔除
-        if "ST" in name.upper():
-            reason["ST"] += 1
-            blocked += 1
-            continue
-
-        # 解禁剔除
         if code in unlock_set:
             reason["解禁"] += 1
             blocked += 1
             continue
 
-        # 连板天数（字段名：连板数）
-        lb_days = _to_int(row.get("连板数", 1))
-        if lb_days > CFG["max_board_days"]:
-            reason["连板过高"] += 1
+        ok, r = hard_filter(row)
+        if not ok:
+            reason[r] = reason.get(r, 0) + 1
             blocked += 1
             continue
 
-        # 换手率过滤
-        turnover_val = _to_num(row.get("换手率", 0))
-        if turnover_val > CFG["max_turnover"]:
-            reason["换手过高"] += 1
-            blocked += 1
-            continue
-
-        # 一字板/巨单封死过滤
-        fengban = _to_num(row.get("封板资金", 0))
-        circ = max(_to_num(row.get("流通市值", 0)), 1)
-        if circ > 0 and fengban / circ > CFG["fengban_ratio"]:
-            reason["一字板"] += 1
-            blocked += 1
-            continue
-
-        # 构造评分字典（字段名全部对齐）
-        row_dict = {
+        d = {
             "换手率": row.get("换手率", 0),
             "成交额": row.get("成交额", 0),
             "涨跌幅": row.get("涨跌幅", 0),
             "流通市值": row.get("流通市值", 0),
-            "连板数": lb_days,
+            "连板数": _to_int(row.get("连板数", 1)),
             "首次封板时间": row.get("首次封板时间", ""),
             "炸板次数": row.get("炸板次数", 0),
-            "所属行业": row.get("所属行业", ""),
         }
-
-        score = calc_score(row_dict)
+        score = calc_score(d)
         if score < CFG["min_score"]:
             continue
 
-        is_morning, time_display = is_morning_zt(row.get("首次封板时间", ""))
-
+        m, td = is_morning_zt(row.get("首次封板时间", ""))
         results.append({
             "代码": code,
             "名称": name,
             "评分": score,
-            "换手率": round(turnover_val, 1),
+            "换手率": round(_to_num(row.get("换手率", 0)), 1),
             "成交额_亿": round(_to_num(row.get("成交额", 0)) / 1e8, 1),
             "涨跌幅": round(_to_num(row.get("涨跌幅", 0)), 2),
             "流通市值_亿": round(_to_num(row.get("流通市值", 0)) / 1e8, 1),
-            "连板天数": lb_days,
-            "封板时间": time_display,
+            "连板天数": _to_int(row.get("连板数", 1)),
+            "封板时间": td,
             "炸板次数": _to_int(row.get("炸板次数", 0)),
-            "早盘": "🌅" if is_morning else "🌙",
+            "早盘": "🌅" if m else "🌙",
             "行业": str(row.get("所属行业", "—")),
         })
 
@@ -263,10 +258,9 @@ def push_wecom(df, webhook):
         for _, row in top.iterrows():
             lines.append(
                 f"{row['名称']}({row['代码']}) 评分{row['评分']} | "
-                f"{row.get('换手率',0):.1f}%换 | "
-                f"{row.get('成交额_亿',0):.1f}亿 | "
-                f"{int(row.get('连板天数',1))}板 | "
-                f"{row.get('封板时间','—')} {row.get('早盘','')}"
+                f"{row.get('换手率', 0):.1f}%换 | {row.get('成交额_亿', 0):.1f}亿 | "
+                f"{int(row.get('连板天数', 1))}板 | "
+                f"{row.get('封板时间', '—')} {row.get('早盘', '')}"
             )
         content = "\n".join(lines)
 
