@@ -2,44 +2,8 @@ name: Daily Pick Push
 
 on:
   schedule:
-    - cron: '30 8 * * 1-5'
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Env check
-        run: |
-          python --version
-          python -c "import akshare, pandas, numpy; print('deps ok')"
-
-      - name: Run picker and push
-        env:
-          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-        run: python daily_pick.py --mode first --top 15 --rankname: Daily Pick Push
-
-on:
-  schedule:
-    - cron: '30 8 * * 1-5'
-  workflow_dispatch:
+    - cron: '30 8 * * 1-5'  # UTC 08:30 = 北京时间 16:30（工作日）
+  workflow_dispatch:         # 支持手动触发测试
 
 permissions:
   contents: read
