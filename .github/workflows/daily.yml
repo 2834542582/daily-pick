@@ -2,22 +2,70 @@ name: Daily Pick Push
 
 on:
   schedule:
-    # 北京时间 16:30 = UTC 08:30，周一到周五
     - cron: '30 8 * * 1-5'
-  workflow_dispatch:  # 允许手动点按钮触发
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Env check
+        run: |
+          python --version
+          python -c "import akshare, pandas, numpy; print('deps ok')"
+
+      - name: Run picker and push
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python daily_pick.py --mode first --top 15 --rankname: Daily Pick Push
+
+on:
+  schedule:
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Env check
+        run: |
+          python --version
+          python -c "import akshare, pandas, numpy; print('deps ok')"
 
       - name: Run picker and push
         env:
