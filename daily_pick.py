@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v6.1
+每日选股推送 - 主线增强版 v6.2
 ===========================================================
-v6.1 相对 v6.0 的改动：
-  1) 新增「🌡️弱势主线」标签（退潮预警）
-     - 真实数据模式：15 ≤ 强度分 < 40 → 弱势主线
-     - 兜底模式：涨停=1 但封板资金合计 > 2 亿 → 弱势主线
-  2) 推送里新增「🌡️衰退预警」段落（前 3 个）
-  3) 推送里把资金流出用 ↘ 标记，一眼看出"看似涨但资金在走"
+v6.2 相对 v6.1 的改动：
+  【P0 修复】
+  1) 评分归一化：原始分可能超过 100（最高 135），改为按实际满分归一化到 100
+     → 修复"135 分和 100 分并列，TOP15 排序失效"的问题
+  2) 新增市场温度择时：涨停家数 + 连板梯队 + 炸板率 三因子
+     → 温度低时推送建议空仓，不推候选
 
-v6.0 关键 bug 修复（保留）：
-  - hard_filter 市值过滤单位错误（元 vs 亿）
-  - hard_filter 一字板过滤单位错误
-  - 非交易日 used_date 标签错误
-  - 探针失败未即熔断
+  【日志 bug 修复】
+  3) 新浪行业源板块名修复：value 格式为 "new_blhy,玻璃行业,..."
+     扫描前 3 字段找第一个中文字段
+  4) 板块标签全"—"修复：
+     - 无资金数据时用成交额作为活跃度代理
+     - 涨幅加上"相对全市场中位数"的偏移
+     - 弱势主线阈值从 15 分下调至 10 分
 
 ===========================================================
 数据口径速查：
@@ -34,20 +36,29 @@ v6.0 关键 bug 修复（保留）：
 
 【板块主线】
   push2     : f3=当日涨幅(%)，f62=当日主力净流入(元)
-  新浪行业  : 涨跌幅(%) + 总成交额(万元)，无资金流
+  新浪行业  : 涨跌幅(%) + 成交额(万元)，无资金流
   同花顺/东财 akshare : 涨跌幅 + 主力净流入
   兜底      : 仅涨停家数 + 封板资金
 
 【板块标签】
   🔥强势主线 : 强度分≥60 且（无资金或资金>0）
   📈升温中   : 40≤强度分<60
-  🌡️弱势主线 : 15≤强度分<40（v6.1 新增）
-  📉走弱     : 强度分<15 且 资金<0
+  🌡️弱势主线 : 10≤强度分<40（v6.2 阈值下调）
+  📉走弱     : 强度分<10 且 资金<0
   ⚠️脉冲     : 涨幅>3 且 资金<0
 
+【市场温度】
+  涨停家数分  : 满分 40
+  连板梯队分  : 满分 30
+  炸板率分    : 满分 30（越低越高）
+  ≥75 热     : 满仓
+  55~75 温   : 半仓
+  35~55 冷   : 轻仓
+  <35 冰冻   : 建议空仓
+
 【评分权重】
-  正常模式满分 100；降级模式把接口依赖项权重转移到本地可算项；
-  正常阈值 75 分，降级阈值 55 分。
+  正常模式最高 135，降级模式最高 110，最终归一化到 100 分制；
+  阈值：正常 75 分，降级 55 分。
 ===========================================================
 """
 # ==================== 全局 requests 超时补丁 ====================
@@ -106,16 +117,19 @@ SCORE_TIME_BUDGET = 60
 SLOW_CALL_THRESHOLD = 3.0
 SLOW_CALL_MAX = 5
 
-# 兜底模式动态阈值
 FALLBACK_STRONG_CNT = 3
 FALLBACK_STRONG_CNT_LOW = 2
 FALLBACK_TOTAL_ZT_LOW = 30
-# v6.1：兜底模式"弱势主线"的封板资金门槛（元）
-FALLBACK_WEAK_SEAL = 2e8     # 2 亿
+FALLBACK_WEAK_SEAL = 2e8
 
-# v6.1：弱势主线强度分区间
-WEAK_STRENGTH_LOW = 15
+# v6.2：弱势主线强度分区间（下限从 15 降到 10）
+WEAK_STRENGTH_LOW = 10
 WEAK_STRENGTH_HIGH = 40
+
+# v6.2：市场温度阈值
+TEMP_HOT = 75
+TEMP_WARM = 55
+TEMP_COLD = 35
 
 HARD_FILTERS = {
     "st": True,
@@ -206,6 +220,10 @@ def _to_int(x):
         return 1
 
 
+def _is_chinese(s: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fa5]", str(s)))
+
+
 def fmt_mcap(yuan_val):
     y = _to_num(yuan_val)
     if y >= 1e8:
@@ -216,7 +234,6 @@ def fmt_mcap(yuan_val):
 
 
 def fmt_net(net_yuan):
-    """资金格式化，返回 (字符串, 是否流出)"""
     n = _to_num(net_yuan)
     if n == 0:
         return "", False
@@ -500,6 +517,11 @@ def _fetch_industry_from_em_direct():
 
 
 def _fetch_industry_from_sina():
+    """
+    v6.2 修复：新浪返回的 value 格式为 "new_blhy,玻璃行业,15,均价,涨跌额,涨跌幅,..."
+    或旧格式 "玻璃行业,15,均价,涨跌额,涨跌幅,..."
+    通过扫描前 3 个字段找到第一个中文字段作为板块名，并据此动态调整后续字段索引。
+    """
     import urllib.request
     url = "http://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
     try:
@@ -524,22 +546,37 @@ def _fetch_industry_from_sina():
         return None
 
     out = []
+    skipped = 0
     for code, val in data.items():
-        parts = str(val).split(",")
-        if len(parts) < 7:
+        parts = [p.strip() for p in str(val).split(",")]
+        if len(parts) < 5:
+            skipped += 1
             continue
-        name = parts[0].strip()
-        if not name:
+        # v6.2: 找第一个中文字段作为板块名
+        name_idx = -1
+        for i in range(min(3, len(parts))):
+            if _is_chinese(parts[i]):
+                name_idx = i
+                break
+        if name_idx < 0:
+            skipped += 1
+            continue
+        name = parts[name_idx]
+        # 标准字段相对 name 的偏移（name 之后第 4 项是涨跌幅，第 6 项是成交额）
+        pct_idx = name_idx + 4
+        amount_idx = name_idx + 6
+        if len(parts) <= pct_idx:
+            skipped += 1
             continue
         out.append({
             "板块":     name,
             "5日涨幅":  0.0,
-            "当日涨幅": _to_num(parts[4]),
+            "当日涨幅": _to_num(parts[pct_idx]),
             "主力净流入": 0.0,
-            "成交额万":  _to_num(parts[6]),
+            "成交额万":  _to_num(parts[amount_idx]) if len(parts) > amount_idx else 0.0,
             "来源":     "新浪行业",
         })
-    log(f"✅ 新浪行业源: {len(out)} 个板块")
+    log(f"✅ 新浪行业源: {len(out)} 个板块（跳过 {skipped} 条格式异常）")
     return pd.DataFrame(out)
 
 
@@ -611,13 +648,6 @@ def _fetch_fund_flow_rank():
 
 
 def _build_from_limitup(zt_df):
-    """
-    兜底模式（v6.1）：
-      - 强势主线：涨停 ≥ strong_threshold
-      - 升温中  ：涨停 = 2
-      - 弱势主线：涨停 = 1 且封板资金合计 ≥ FALLBACK_WEAK_SEAL
-      - —       ：其它
-    """
     if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
         return pd.DataFrame()
 
@@ -648,9 +678,7 @@ def _build_from_limitup(zt_df):
         seal = float(r["封板资金合计"] or 0)
         out.append({
             "板块":       str(r["industry"]),
-            "5日涨幅":     0.0,
-            "当日涨幅":    0.0,
-            "主力净流入":   0.0,
+            "5日涨幅":     0.0, "当日涨幅": 0.0, "主力净流入": 0.0,
             "涨停家数":     cnt,
             "封板资金合计":  seal,
             "平均封板资金":  float(r["平均封板资金"] or 0),
@@ -669,15 +697,13 @@ def _build_from_limitup(zt_df):
 
 def get_sector_rotation(zt_df=None):
     """
-    板块主线监测 v6.1
+    板块主线监测 v6.2
     优先级：push2 → 新浪 → 同花顺 → 东财 → 资金流排名 → 兜底
-    新增标签：🌡️弱势主线（15 ≤ 强度分 < 40）
     """
     rows, seen = [], set()
     status = "ok"
     source_chain = []
 
-    # ① push2 直连
     try:
         d = _fetch_industry_from_em_direct()
         if d is not None and not d.empty:
@@ -688,7 +714,6 @@ def get_sector_rotation(zt_df=None):
     except Exception as e:
         log(f"⚠ push2 异常: {e}", "WARN")
 
-    # ② 新浪行业
     if not rows:
         try:
             d = _fetch_industry_from_sina()
@@ -700,7 +725,6 @@ def get_sector_rotation(zt_df=None):
         except Exception as e:
             log(f"⚠ 新浪异常: {e}", "WARN")
 
-    # ③ 同花顺
     if not rows:
         try:
             d = _fetch_industry_from_ths()
@@ -712,7 +736,6 @@ def get_sector_rotation(zt_df=None):
         except Exception as e:
             log(f"⚠ 同花顺异常: {e}", "WARN")
 
-    # ④ 东财 akshare
     if not rows:
         try:
             d = _fetch_industry_from_em()
@@ -724,7 +747,6 @@ def get_sector_rotation(zt_df=None):
         except Exception as e:
             log(f"⚠ 东财异常: {e}", "WARN")
 
-    # ⑤ 5 日资金流排名
     try:
         d = _fetch_fund_flow_rank()
         if d is not None and not d.empty:
@@ -741,7 +763,6 @@ def get_sector_rotation(zt_df=None):
     except Exception as e:
         log(f"⚠ 资金流排名异常: {e}", "WARN")
 
-    # ⑥ 兜底
     if not rows:
         log("⚠ 外部板块源全挂，启用涨停池聚合兜底", "WARN")
         d = _build_from_limitup(zt_df)
@@ -753,7 +774,18 @@ def get_sector_rotation(zt_df=None):
     has_5d = "5日涨幅" in df.columns and df["5日涨幅"].abs().sum() > 0
     has_1d = "当日涨幅" in df.columns and df["当日涨幅"].abs().sum() > 0
     has_net = "主力净流入" in df.columns and df["主力净流入"].abs().sum() > 0
+    has_amount = "成交额万" in df.columns and df["成交额万"].abs().sum() > 0
     has_real_pct = has_5d or has_1d
+
+    # v6.2: 计算全市场板块涨幅中位数，作为相对强弱基准
+    if has_1d:
+        pct_median = df["当日涨幅"].median()
+    elif has_5d:
+        pct_median = df["5日涨幅"].median()
+    else:
+        pct_median = 0.0
+
+    amt_median = df["成交额万"].median() if has_amount else 0.0
 
     def _get_pct(r):
         if has_5d and r.get("5日涨幅", 0) != 0:
@@ -763,41 +795,58 @@ def get_sector_rotation(zt_df=None):
         return 0, ""
 
     def calc_strength(r):
+        s = 0
         if has_real_pct:
             pct, kind = _get_pct(r)
-            s = 0
+            # v6.2: 用相对中位数的强弱（同时保留绝对档位）
+            rel = pct - pct_median
             if kind == "当日":
                 if pct >= 3:     s += 30
                 elif pct >= 1.5: s += 20
+                elif pct >= 0.5: s += 15
                 elif pct >= 0:   s += 10
+                elif pct >= -1:  s += 0
+                else:            s -= 10
+                # 相对强弱的额外加分（避免全市场普跌时全挤在低档）
+                if rel >= 1.5:   s += 10
+                elif rel >= 0.5: s += 5
             else:
                 if pct >= 5:     s += 30
                 elif pct >= 2:   s += 20
                 elif pct >= 0:   s += 10
+                else:            s -= 5
+
             if has_net:
-                if r["主力净流入"] > 0:    s += 30
-                elif r["主力净流入"] < 0:  s -= 15
+                net = r["主力净流入"]
+                if net > 0:    s += 30
+                elif net < 0:  s -= 15
+            elif has_amount:
+                # v6.2: 无资金数据时用成交额活跃度代理
+                amt = r.get("成交额万", 0)
+                if amt >= amt_median * 1.5:
+                    s += 20
+                elif amt >= amt_median:
+                    s += 10
+                else:
+                    s -= 5
             return s
-        cnt = r.get("涨停家数", 0)
-        return 50 if cnt >= 5 else 35 if cnt >= 3 else 20 if cnt >= 2 else 10
+        else:
+            cnt = r.get("涨停家数", 0)
+            return 50 if cnt >= 5 else 35 if cnt >= 3 else 20 if cnt >= 2 else 10
 
     df["强度分"] = df.apply(calc_strength, axis=1)
 
     def label(r):
-        # 兜底模式
+        s = r["强度分"]
+
         if not has_real_pct:
             cnt = r.get("涨停家数", 0)
             seal = _to_num(r.get("封板资金合计", 0))
-            if cnt >= 3:
-                return "🔥强势主线"
-            elif cnt >= 2:
-                return "📈升温中"
-            elif cnt == 1 and seal >= FALLBACK_WEAK_SEAL:
-                return "🌡️弱势主线"
+            if cnt >= 3: return "🔥强势主线"
+            elif cnt >= 2: return "📈升温中"
+            elif cnt == 1 and seal >= FALLBACK_WEAK_SEAL: return "🌡️弱势主线"
             return "—"
 
-        # 真实数据模式（v6.1 五档分类）
-        s = r["强度分"]
         net = r["主力净流入"] if has_net else 0
         pct, _ = _get_pct(r)
 
@@ -805,25 +854,20 @@ def get_sector_rotation(zt_df=None):
             return "🔥强势主线"
         if s >= 40:
             return "📈升温中"
-        # v6.1 新增：弱势主线（有微弱涨幅，但资金不够/强度不够）
         if WEAK_STRENGTH_LOW <= s < WEAK_STRENGTH_HIGH:
             return "🌡️弱势主线"
-        # 明确撤退
-        if s < WEAK_STRENGTH_LOW and has_net and net < 0:
+        if s < WEAK_STRENGTH_LOW and (not has_net or net < 0):
             return "📉走弱"
-        # 脉冲（一日游风险）
         if has_net and pct > 3 and net < 0:
             return "⚠️脉冲"
         return "—"
 
     df["状态"] = df.apply(label, axis=1)
-    sort_cols = ["强度分"]
-    sort_asc = [False]
+    sort_cols = ["强度分"]; sort_asc = [False]
     if has_net:
         sort_cols.append("主力净流入"); sort_asc.append(False)
     df = df.sort_values(sort_cols, ascending=sort_asc).reset_index(drop=True)
 
-    # 统计各标签数量
     cnt_strong = int((df["状态"] == "🔥强势主线").sum())
     cnt_warm   = int((df["状态"] == "📈升温中").sum())
     cnt_weak   = int((df["状态"] == "🌡️弱势主线").sum())
@@ -834,6 +878,64 @@ def get_sector_rotation(zt_df=None):
     log(f"✅ 板块主线分析完成: {len(df)} 个板块 | 源={src_str} | 口径={calib}")
     log(f"   标签分布: 🔥{cnt_strong} 📈{cnt_warm} 🌡️{cnt_weak} 📉{cnt_down}")
     return df, status
+
+
+# ==================== 市场温度（v6.2 新增）====================
+def calc_market_temperature(zt_df):
+    """
+    市场温度（0~100）。
+    口径：
+      涨停家数分（满分 40）：≥80 家→40；≥60→35；≥40→25；≥20→15；<20→5
+      连板梯队分（满分 30）：最高连板 + 2 板以上家数
+      炸板率分（满分 30）：炸板次数>0 的票占比，越低越高
+    返回：(温度, 明细 dict)
+    """
+    if zt_df is None or zt_df.empty:
+        return 0, {"涨停家数": 0, "最高连板": 0, "连板家数": 0, "炸板率": "N/A"}
+
+    zt_count = len(zt_df)
+
+    if zt_count >= 80:   cnt_score = 40
+    elif zt_count >= 60: cnt_score = 35
+    elif zt_count >= 40: cnt_score = 25
+    elif zt_count >= 20: cnt_score = 15
+    else:                cnt_score = 5
+
+    max_board = int(zt_df["board_count"].max()) if "board_count" in zt_df.columns else 1
+    multi_board = int((zt_df["board_count"] >= 2).sum()) if "board_count" in zt_df.columns else 0
+    ladder_score = 0
+    if max_board >= 4:      ladder_score += 15
+    elif max_board >= 3:    ladder_score += 10
+    elif max_board >= 2:    ladder_score += 5
+    if multi_board >= 10:   ladder_score += 15
+    elif multi_board >= 5:  ladder_score += 10
+    elif multi_board >= 2:  ladder_score += 5
+
+    if "open_times" in zt_df.columns and zt_count > 0:
+        broken = int((zt_df["open_times"] > 0).sum())
+        broken_ratio = broken / zt_count
+    else:
+        broken_ratio = 0.3
+    if broken_ratio <= 0.15:   br_score = 30
+    elif broken_ratio <= 0.25: br_score = 20
+    elif broken_ratio <= 0.35: br_score = 10
+    else:                      br_score = 0
+
+    temp = cnt_score + ladder_score + br_score
+    detail = {
+        "涨停家数": zt_count,
+        "最高连板": max_board,
+        "连板家数": multi_board,
+        "炸板率":   f"{broken_ratio:.1%}",
+    }
+    return temp, detail
+
+
+def temp_label(temp):
+    if temp >= TEMP_HOT:   return "🔥 热", "满仓操作，主升浪可期"
+    if temp >= TEMP_WARM:  return "☀️ 温", "半仓操作，优先主线龙头"
+    if temp >= TEMP_COLD:  return "🌥️ 冷", "轻仓试探，严格止损"
+    return "❄️ 冰冻", "建议空仓观望"
 
 
 # ==================== 硬过滤 ====================
@@ -881,24 +983,41 @@ def hard_filter(df):
     return df, reasons
 
 
-# ==================== 评分 ====================
+# ==================== 评分（v6.2 归一化）====================
 def score_stock(row, sector_counts, use_fund, use_ma):
+    """
+    返回 (原始分, 满分, 加分理由)
+    v6.2：由调用方负责归一化到 100 分制。
+    满分口径：
+      - board_count 最多 15（不是权重 ×N）
+      - fund_flow 两项只在 use_fund 时计入
+      - ma_bull / return_shot / limit_gene 只在 use_ma 时计入
+    """
     global _fund_circuit_broken, _kline_circuit_broken
     weights = WEIGHTS_DEGRADED if (_fund_circuit_broken or _kline_circuit_broken) else WEIGHTS_NORMAL
     score = 0
+    max_score = 0
     reasons = []
 
+    # 1) 连板（满分 15）
+    max_score += 15
     bc = _to_int(row.get("board_count", 1))
     if bc >= 2:
-        s = min(bc * weights["board_count"], 15); score += s
+        s = min(bc * weights["board_count"], 15)
+        score += s
         reasons.append(f"连板{bc}层(+{s})")
 
+    # 2) 主线（固定分）
+    max_score += weights["sector_main"]
     ind = str(row.get("industry", "未知"))
     if sector_counts.get(ind, 0) >= 3:
-        s = weights["sector_main"]; score += s
+        s = weights["sector_main"]
+        score += s
         reasons.append(f"主线({ind}{sector_counts[ind]}家)(+{s})")
 
+    # 3) 资金流（仅 use_fund 且权重>0）
     if use_fund and weights["fund_flow_5d"] > 0:
+        max_score += weights["fund_flow_5d"] + weights["fund_flow_10d"]
         n5, n10 = get_fund_flow(str(row.get("code", "")).zfill(6))
         if n5 > 0:
             s = min(int(n5 / 1000), weights["fund_flow_5d"]); score += s
@@ -907,16 +1026,24 @@ def score_stock(row, sector_counts, use_fund, use_ma):
             s = min(int(n10 / 2000), weights["fund_flow_10d"]); score += s
             reasons.append(f"10日+{n10:.0f}万(+{s})")
 
+    # 4) 早盘封板
+    max_score += weights["morning_lobby"]
     ft = parse_ftime(row.get("first_time"))
     if ft and ft.hour < 10:
         s = weights["morning_lobby"]; score += s
         reasons.append(f"早盘{ft.strftime('%H:%M')}(+{s})")
 
+    # 5) 未开板
+    max_score += weights["no_open"]
     if _to_int(row.get("open_times", 1)) == 0:
         s = weights["no_open"]; score += s
         reasons.append(f"未开板(+{s})")
 
+    # 6) 均线 / 回马枪 / 涨停基因（仅 use_ma 且权重>0）
     if use_ma and not _kline_circuit_broken and weights["ma_bull"] > 0:
+        max_score += weights["ma_bull"] + weights["return_shot"]
+        if weights["limit_gene"] > 0:
+            max_score += weights["limit_gene"]
         kl = get_kline(str(row.get("code", "")).zfill(6))
         if check_ma_bull(kl):
             s = weights["ma_bull"]; score += s
@@ -928,21 +1055,27 @@ def score_stock(row, sector_counts, use_fund, use_ma):
             s = weights["limit_gene"]; score += s
             reasons.append(f"20日涨停基因(+{s})")
 
+    # 7) 市值加分
+    max_score += weights["market_cap_bonus"]
     mcap = _to_num(row.get("total_market_cap", 0))
     if 30 <= mcap / 1e8 <= 100:
         s = weights["market_cap_bonus"]; score += s
         reasons.append(f"市值{fmt_mcap(mcap)}(+{s})")
 
+    # 8) 换手健康
+    max_score += weights["turnover_good"]
     to = _to_num(row.get("turnover", 0))
     if 5 <= to <= 15:
         s = weights["turnover_good"]; score += s
         reasons.append(f"换手{to:.1f}%健康(+{s})")
 
+    # 9) 封单
+    max_score += weights["seal_amount"]
     if _to_num(row.get("seal_amount", 0)) > 0:
         s = weights["seal_amount"]; score += s
         reasons.append(f"有封单(+{s})")
 
-    return min(score, 100), reasons
+    return score, max_score, reasons
 
 
 # ==================== 推送 ====================
@@ -967,7 +1100,6 @@ def send_wecom_webhook(webhook_url, content):
 
 
 def _fmt_sector_line(r):
-    """格式化单行板块信息"""
     p5 = _to_num(r.get("5日涨幅", 0))
     p1 = _to_num(r.get("当日涨幅", 0))
     net = _to_num(r.get("主力净流入", 0))
@@ -995,6 +1127,16 @@ def _fmt_sector_line(r):
     return f"- {' | '.join(parts)}"
 
 
+def format_market_temp_section(temp, detail):
+    label, advice = temp_label(temp)
+    msg = "\n### 🌡️ 市场温度\n"
+    msg += f"**{label}：{temp}/100**\n"
+    msg += f"> 涨停 {detail['涨停家数']} 家 | 最高连板 {detail['最高连板']} 层 | "
+    msg += f"连板家数 {detail['连板家数']} 家 | 炸板率 {detail['炸板率']}\n"
+    msg += f"> **建议**：{advice}\n"
+    return msg
+
+
 def format_sector_section(sec_df, status):
     if sec_df is None or sec_df.empty:
         return "\n### 🌐 板块主线监测\n> ⚠️ 本次未取到任何板块数据，主线判断暂缺\n"
@@ -1006,7 +1148,6 @@ def format_sector_section(sec_df, status):
     if is_fallback:
         msg += "> ⚠️ 数据置信度：低（无板块涨幅/资金流，仅按涨停家数聚合）\n"
 
-    # 🔥 强势主线
     strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(6)
     if not strong.empty:
         msg += "\n**🔥 强势主线**\n"
@@ -1015,7 +1156,6 @@ def format_sector_section(sec_df, status):
     else:
         msg += "\n> 🔥 暂无达到阈值的强势主线\n"
 
-    # 🌡️ 弱势主线（v6.1 新增）
     weak = sec_df[sec_df["状态"] == "🌡️弱势主线"].head(3)
     if not weak.empty:
         msg += "\n**🌡️ 衰退预警**（涨幅微弱、资金不足，可能是退潮主线）\n"
@@ -1025,27 +1165,46 @@ def format_sector_section(sec_df, status):
     return msg
 
 
-def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status, min_score_used, is_degraded):
+def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status,
+                   min_score_used, is_degraded, temp, temp_detail):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     used = df.attrs.get("used_date", "") if hasattr(df, "attrs") else ""
     used_line = f" | 数据日:{used}" if used else ""
     mode_str = "降级模式" if is_degraded else "正常"
-    msg = f"## 📈 每日选股推送 - {tag}\n**时间**: {now}{used_line} | **模式**: {mode}\n"
+
+    msg = f"## 📈 每日选股推送 - {tag}\n"
+    msg += f"**时间**: {now}{used_line} | **模式**: {mode}\n"
     msg += f"**阈值**: {min_score_used}分（{mode_str}）\n"
+
+    # 市场温度（v6.2 新增）
+    msg += format_market_temp_section(temp, temp_detail)
+
+    # 板块主线
     msg += format_sector_section(sec_df, sec_status)
+
+    # 候选标的
     msg += f"\n### 🏆 候选标的（≥{min_score_used}分，{len(df)}只）\n"
-    if df.empty:
+
+    # v6.2：温度过低时打警告
+    if temp < TEMP_COLD:
+        msg += "> ❄️ **市场温度过低，建议空仓**。以下候选仅供参考，不建议实际买入。\n"
+    elif df.empty:
         msg += "> 今日无符合标准的标的，建议空仓观望。\n"
-    else:
+
+    if not df.empty:
         for i, (_, r) in enumerate(df.head(15).iterrows(), 1):
             msg += f"\n**{i}. {r.get('name','')}** (`{r.get('code','')}`)\n"
-            msg += f"- 评分:**{r.get('score',0)}** | 板块:{r.get('industry','N/A')} | 连板:{_to_int(r.get('board_count',1))}\n"
+            raw = r.get("raw_score", 0)
+            maxs = r.get("max_score", 100)
+            msg += f"- 评分:**{r.get('score',0)}/100**（原始 {raw}/{maxs}）| 板块:{r.get('industry','N/A')} | 连板:{_to_int(r.get('board_count',1))}\n"
             msg += f"- 换手:{_to_num(r.get('turnover',0)):.1f}% | 市值:{fmt_mcap(r.get('total_market_cap',0))}\n"
             if "reasons" in r and r["reasons"]:
                 msg += f"- 亮点: {'、'.join(r['reasons'][:3])}\n"
+
     msg += "\n### 📊 过滤统计\n"
     for r in filtered_reasons:
         msg += f"- {r}\n"
+
     msg += "\n> 💡 初筛结果，不构成投资建议。"
     return msg
 
@@ -1072,7 +1231,7 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v6.1 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v6.2 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
         user_specified_threshold = args.min_score is not None
@@ -1086,7 +1245,14 @@ def main():
                 "\n**原因**: 最近交易日涨停池均为空")
             sys.exit(1)
 
-        # 2. 板块主线
+        # 2. 市场温度（v6.2）
+        temp, temp_detail = calc_market_temperature(df_raw)
+        temp_lbl, temp_advice = temp_label(temp)
+        log(f"🌡️ 市场温度: {temp}/100 ({temp_lbl}) | 涨停{temp_detail['涨停家数']}家 "
+            f"最高{temp_detail['最高连板']}板 连板{temp_detail['连板家数']}家 炸板率{temp_detail['炸板率']}")
+        log(f"   建议: {temp_advice}")
+
+        # 3. 板块主线
         log("🌐 板块主线监测...")
         sec_df, sec_status = get_sector_rotation(df_raw)
         if not sec_df.empty:
@@ -1097,23 +1263,23 @@ def main():
             log(f"✅ 板块TOP3: {' | '.join(top3_parts)}")
             _dump_debug(sec_df, "sector_rotation_result")
 
-        # 3. 板块统计
+        # 4. 板块统计
         sector_counts = {}
         if "industry" in df_raw.columns:
             sector_counts = df_raw["industry"].value_counts().to_dict()
             top3 = sorted(sector_counts.items(), key=lambda x: (-x[1], x[0]))[:3]
             log(f"📊 涨停板块TOP3: {' | '.join(f'{k}({v})' for k,v in top3)}")
 
-        # 4. 硬过滤
+        # 5. 硬过滤
         df, filtered_reasons = hard_filter(df_raw)
         if df.empty:
             log("📭 过滤后无标的")
             send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
                               format_message(df, mode, tag, filtered_reasons, sec_df, sec_status,
-                                             min_score, is_degraded=False))
+                                             min_score, is_degraded=False, temp=temp, temp_detail=temp_detail))
             return
 
-        # 5. 探针预检
+        # 6. 探针
         log(f"🔬 探针预检接口可用性（{PROBE_N} 只）...")
         probe = df.head(min(PROBE_N, len(df)))
         for _, row in probe.iterrows():
@@ -1126,15 +1292,15 @@ def main():
         if not args.no_fund and _fund_fail_count > 0 and not _fund_circuit_broken:
             _fund_circuit_broken = True
             _fund_fast_fail = True
-            log(f"🚫 探针资金流失败（{_fund_fail_count}/{PROBE_N}），接口不可用，熔断", "WARN")
+            log(f"🚫 探针资金流失败（{_fund_fail_count}/{PROBE_N}），熔断", "WARN")
         if not args.no_ma and _kline_fail_count > 0 and not _kline_circuit_broken:
             _kline_circuit_broken = True
             _kline_fast_fail = True
-            log(f"🚫 探针K线失败（{_kline_fail_count}/{PROBE_N}），接口不可用，熔断", "WARN")
+            log(f"🚫 探针K线失败（{_kline_fail_count}/{PROBE_N}），熔断", "WARN")
 
         log(f"🔬 预检完成: 资金熔断={_fund_circuit_broken} K线熔断={_kline_circuit_broken}")
 
-        # 6. 降级判定
+        # 7. 降级判定
         use_fund = not args.no_fund and not _fund_circuit_broken
         use_ma = not args.no_ma and not _kline_circuit_broken
         is_degraded = False
@@ -1143,12 +1309,12 @@ def main():
             is_degraded = True
             log(f"⚠️ 接口降级，阈值自动从{DEFAULT_MIN_SCORE}调整为{min_score}", "WARN")
 
-        # 7. 评分（含时间预算保护）
+        # 8. 评分（v6.2：归一化到 100 分制）
         log(f"📝 开始评分 {len(df)} 只（资金={'开' if use_fund else '关'} "
             f"均线={'开' if use_ma else '关'} 阈值={min_score} 预算={SCORE_TIME_BUDGET}s）...")
         t_start = time.time()
         budget_exhausted = False
-        scores, all_reasons = [], []
+        raw_scores, max_scores, norm_scores, all_reasons = [], [], [], []
 
         for idx, (_, row) in enumerate(df.iterrows()):
             elapsed = time.time() - t_start
@@ -1158,43 +1324,50 @@ def main():
                     _fund_circuit_broken = True
                 if not _kline_circuit_broken:
                     _kline_circuit_broken = True
-                log(f"⏰ 评分阶段超预算 {elapsed:.0f}s > {SCORE_TIME_BUDGET}s，"
-                    f"剩余 {len(df)-idx} 只跳过外部接口，改走降级权重", "WARN")
+                log(f"⏰ 评分阶段超预算 {elapsed:.0f}s，剩余 {len(df)-idx} 只改走降级权重", "WARN")
                 if not user_specified_threshold:
                     min_score = DEGRADED_MIN_SCORE
                     is_degraded = True
 
             _use_net = not budget_exhausted and not (_fund_circuit_broken and _kline_circuit_broken)
-            s, rs = score_stock(row, sector_counts,
-                                use_fund=use_fund and _use_net and not _fund_circuit_broken,
-                                use_ma=use_ma and _use_net and not _kline_circuit_broken)
-            scores.append(s)
+            raw, mx, rs = score_stock(row, sector_counts,
+                                      use_fund=use_fund and _use_net and not _fund_circuit_broken,
+                                      use_ma=use_ma and _use_net and not _kline_circuit_broken)
+            norm = int(round(raw / mx * 100)) if mx > 0 else 0
+            raw_scores.append(raw)
+            max_scores.append(mx)
+            norm_scores.append(norm)
             all_reasons.append(rs)
 
             if (idx + 1) % 10 == 0:
                 log(f"  ⏳ {idx+1}/{len(df)} 只 ({time.time()-t_start:.1f}s)")
 
         df = df.copy()
-        df["score"] = scores
+        df["raw_score"] = raw_scores
+        df["max_score"] = max_scores
+        df["score"] = norm_scores
         df["reasons"] = all_reasons
-        df_f = df[df["score"] >= min_score].sort_values("score", ascending=False).head(args.top)
+        df_f = df[df["score"] >= min_score].sort_values(
+            ["score", "raw_score"], ascending=[False, False]
+        ).head(args.top)
         log(f"✅ 达标 {len(df_f)} 只 ≥ {min_score}分 ({time.time()-t_start:.1f}s)")
 
-        # 8. 落盘
+        # 9. 落盘
         out_dir = os.environ.get("OUTPUT_DIR", "results")
         os.makedirs(out_dir, exist_ok=True)
         if not df_f.empty:
-            cols = [c for c in ["code", "name", "score", "industry", "board_count",
-                                 "turnover", "total_market_cap"] if c in df_f.columns]
+            cols = [c for c in ["code", "name", "score", "raw_score", "max_score",
+                                 "industry", "board_count", "turnover", "total_market_cap"]
+                    if c in df_f.columns]
             df_f[cols].to_csv(
                 f"{out_dir}/pick_{datetime.now().strftime('%Y%m%d')}_{mode}.csv",
                 index=False, encoding="utf-8-sig")
             log(f"💾 已保存 {len(df_f)}只")
 
-        # 9. 推送
+        # 10. 推送
         send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
                           format_message(df_f, mode, tag, filtered_reasons, sec_df, sec_status,
-                                         min_score, is_degraded))
+                                         min_score, is_degraded, temp, temp_detail))
         log("✅ 选股完成")
 
     except Exception as e:
