@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v6.0
+每日选股推送 - 主线增强版 v6.1
 ===========================================================
-v6.0 相对 v5.9 的改动：
-  【关键 bug 修复】
-  1) hard_filter 市值过滤单位错误（元 vs 亿）→ 一直失效
-  2) hard_filter 一字板过滤单位错误（circ 多乘 1e8）→ 一直失效
-  3) 非交易日 used_date 标签错误（把 10/1 当成交易日）
-  4) 探针失败未即熔断（探针 1 只 < 阈值 2，进评分又撞墙）
+v6.1 相对 v6.0 的改动：
+  1) 新增「🌡️弱势主线」标签（退潮预警）
+     - 真实数据模式：15 ≤ 强度分 < 40 → 弱势主线
+     - 兜底模式：涨停=1 但封板资金合计 > 2 亿 → 弱势主线
+  2) 推送里新增「🌡️衰退预警」段落（前 3 个）
+  3) 推送里把资金流出用 ↘ 标记，一眼看出"看似涨但资金在走"
 
-  【新增数据源】
-  5) 新浪行业源（海外可访问），作为 push2 的备选
-     优先级：push2 → 新浪 → 同花顺 → 东财 → 资金流排名 → 兜底
-
-  【兜底模式增强】
-  6) 动态阈值：总涨停 < 30 家时，强势主线阈值从 3 家降到 2 家
-  7) 兜底板块强度用「封板资金合计 + 涨停家数」双重信号
-  8) 推送文案明确标注「数据置信度：低」
+v6.0 关键 bug 修复（保留）：
+  - hard_filter 市值过滤单位错误（元 vs 亿）
+  - hard_filter 一字板过滤单位错误
+  - 非交易日 used_date 标签错误
+  - 探针失败未即熔断
 
 ===========================================================
 数据口径速查：
@@ -29,21 +26,27 @@ v6.0 相对 v5.9 的改动：
   所属行业为东财口径（非申万）。
 
 【资金流 stock_individual_fund_flow / 东财】
-  主力净流入 = 超大单净额 + 大单净额（不含中单/小单）；
+  主力净流入 = 超大单净额 + 大单净额；
   本脚本用「近5日累计 / 近10日累计」，单位【元】。
 
 【K线 stock_zh_a_hist / 东财】
-  前复权（adjust="qfq"）；MA5/10/20 为收盘价 SMA；
-  涨停近似为单日涨幅 ≥ 9.8%。
+  前复权；MA5/10/20 为收盘价 SMA；涨停近似为单日涨幅 ≥ 9.8%。
 
 【板块主线】
   push2     : f3=当日涨幅(%)，f62=当日主力净流入(元)
   新浪行业  : 涨跌幅(%) + 总成交额(万元)，无资金流
   同花顺/东财 akshare : 涨跌幅 + 主力净流入
-  兜底      : 仅涨停家数 + 封板资金，无涨幅/无资金流
+  兜底      : 仅涨停家数 + 封板资金
+
+【板块标签】
+  🔥强势主线 : 强度分≥60 且（无资金或资金>0）
+  📈升温中   : 40≤强度分<60
+  🌡️弱势主线 : 15≤强度分<40（v6.1 新增）
+  📉走弱     : 强度分<15 且 资金<0
+  ⚠️脉冲     : 涨幅>3 且 资金<0
 
 【评分权重】
-  正常模式满分 100，降级模式把接口依赖项权重转移到本地可算项；
+  正常模式满分 100；降级模式把接口依赖项权重转移到本地可算项；
   正常阈值 75 分，降级阈值 55 分。
 ===========================================================
 """
@@ -103,19 +106,25 @@ SCORE_TIME_BUDGET = 60
 SLOW_CALL_THRESHOLD = 3.0
 SLOW_CALL_MAX = 5
 
-# v6.0：兜底模式动态阈值
-FALLBACK_STRONG_CNT = 3          # 总涨停 ≥ 30 家时的强势主线阈值
-FALLBACK_STRONG_CNT_LOW = 2      # 总涨停 < 30 家时降低阈值
+# 兜底模式动态阈值
+FALLBACK_STRONG_CNT = 3
+FALLBACK_STRONG_CNT_LOW = 2
 FALLBACK_TOTAL_ZT_LOW = 30
+# v6.1：兜底模式"弱势主线"的封板资金门槛（元）
+FALLBACK_WEAK_SEAL = 2e8     # 2 亿
+
+# v6.1：弱势主线强度分区间
+WEAK_STRENGTH_LOW = 15
+WEAK_STRENGTH_HIGH = 40
 
 HARD_FILTERS = {
     "st": True,
     "max_boards": 3,
     "max_turnover": 28.0,
     "one_word": True,
-    "min_market_cap": 15.0,      # 单位：亿元（v6.0 修正比较口径）
+    "min_market_cap": 15.0,
     "late_afternoon": True,
-    "seal_ratio_one_word": 0.08, # 一字板判据：封板资金 / 流通市值 > 8%
+    "seal_ratio_one_word": 0.08,
 }
 
 WEIGHTS_NORMAL = {
@@ -198,13 +207,22 @@ def _to_int(x):
 
 
 def fmt_mcap(yuan_val):
-    """市值格式化：输入单位【元】，输出 '15.0亿' / '5000万' 等"""
     y = _to_num(yuan_val)
     if y >= 1e8:
         return f"{y/1e8:.1f}亿"
     elif y >= 1e4:
         return f"{y/1e4:.0f}万"
     return f"{y:.0f}元"
+
+
+def fmt_net(net_yuan):
+    """资金格式化，返回 (字符串, 是否流出)"""
+    n = _to_num(net_yuan)
+    if n == 0:
+        return "", False
+    if abs(n) >= 1e8:
+        return f"{n/1e8:+.2f}亿", n < 0
+    return f"{n/1e4:+.0f}万", n < 0
 
 
 def _find_col(df, *keywords):
@@ -255,10 +273,6 @@ def _get_recent_trade_dates(n: int = 10) -> List[str]:
 
 
 def _normalize(df: pd.DataFrame, used_date: str) -> pd.DataFrame:
-    """
-    列名标准化。
-    注意：市值/封板资金/成交额单位均为【元】，不在此处转换。
-    """
     mapping = {
         "代码": "code", "名称": "name", "涨跌幅": "pct_change", "最新价": "price",
         "成交额": "amount", "流通市值": "circ_market_cap", "总市值": "total_market_cap",
@@ -283,10 +297,6 @@ def _normalize(df: pd.DataFrame, used_date: str) -> pd.DataFrame:
 
 
 def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
-    """
-    v6.0 修复：不再把 today 单独塞进候选，优先用交易日历。
-    避免非交易日把 used_date 标错（如 10/1 假期会错标成 10/1）。
-    """
     import akshare as ak
     if trade_date:
         candidates = [trade_date]
@@ -443,7 +453,6 @@ def get_fund_flow(code: str):
 
 # ==================== 板块数据源 ====================
 def _fetch_industry_from_em_direct():
-    """东财 push2 直连"""
     import urllib.request
     url = ("https://push2.eastmoney.com/api/qt/clist/get"
            "?pn=1&pz=200&po=1&np=1&fltt=2&invt=2&fid=f3"
@@ -491,12 +500,6 @@ def _fetch_industry_from_em_direct():
 
 
 def _fetch_industry_from_sina():
-    """
-    v6.0 新增：新浪行业接口（海外可访问）。
-    URL  : http://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php
-    格式 : var S_Finance_bankuai_sinaindustry = {"code":"名,家数,均价,涨跌额,涨跌幅,量,额,领涨股,...", ...};
-    字段 : [0]板块名 [1]公司家数 [2]均价 [3]涨跌额 [4]涨跌幅(%) [5]成交量 [6]成交额(万元) [7]领涨股
-    """
     import urllib.request
     url = "http://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
     try:
@@ -531,9 +534,9 @@ def _fetch_industry_from_sina():
         out.append({
             "板块":     name,
             "5日涨幅":  0.0,
-            "当日涨幅": _to_num(parts[4]),   # 涨跌幅(%)
-            "主力净流入": 0.0,                # 新浪无资金流
-            "成交额万":  _to_num(parts[6]),   # 成交额(万元)
+            "当日涨幅": _to_num(parts[4]),
+            "主力净流入": 0.0,
+            "成交额万":  _to_num(parts[6]),
             "来源":     "新浪行业",
         })
     log(f"✅ 新浪行业源: {len(out)} 个板块")
@@ -609,9 +612,11 @@ def _fetch_fund_flow_rank():
 
 def _build_from_limitup(zt_df):
     """
-    v6.0 增强兜底：
-    - 阈值动态调整（总涨停 < 30 家时强势阈值从 3 → 2）
-    - 板块强度用「封板资金合计 + 涨停家数」双重信号
+    兜底模式（v6.1）：
+      - 强势主线：涨停 ≥ strong_threshold
+      - 升温中  ：涨停 = 2
+      - 弱势主线：涨停 = 1 且封板资金合计 ≥ FALLBACK_WEAK_SEAL
+      - —       ：其它
     """
     if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
         return pd.DataFrame()
@@ -629,27 +634,29 @@ def _build_from_limitup(zt_df):
     total_zt = int(grp["涨停家数"].sum())
     strong_threshold = (FALLBACK_STRONG_CNT_LOW if total_zt < FALLBACK_TOTAL_ZT_LOW
                         else FALLBACK_STRONG_CNT)
-    log(f"📊 兜底模式：总涨停 {total_zt} 家，强势主线阈值={strong_threshold} 家")
+    log(f"📊 兜底模式：总涨停 {total_zt} 家，强势阈值={strong_threshold} 家")
 
-    def _status(cnt):
+    def _status(cnt, seal):
         if cnt >= strong_threshold:  return "🔥强势主线"
         elif cnt >= 2:               return "📈升温中"
+        elif cnt == 1 and seal >= FALLBACK_WEAK_SEAL: return "🌡️弱势主线"
         return "—"
 
     out = []
     for _, r in grp.iterrows():
         cnt = int(r["涨停家数"])
+        seal = float(r["封板资金合计"] or 0)
         out.append({
             "板块":       str(r["industry"]),
             "5日涨幅":     0.0,
             "当日涨幅":    0.0,
             "主力净流入":   0.0,
             "涨停家数":     cnt,
-            "封板资金合计":  float(r["封板资金合计"] or 0),
+            "封板资金合计":  seal,
             "平均封板资金":  float(r["平均封板资金"] or 0),
             "平均换手":     float(r["平均换手"] or 0),
             "来源":       "涨停池聚合",
-            "状态":       _status(cnt),
+            "状态":       _status(cnt, seal),
             "强度分":      cnt * 10,
         })
     df = pd.DataFrame(out).sort_values(
@@ -662,11 +669,13 @@ def _build_from_limitup(zt_df):
 
 def get_sector_rotation(zt_df=None):
     """
-    v6.0 优先级：push2 → 新浪 → 同花顺 → 东财 → 资金流排名 → 兜底
+    板块主线监测 v6.1
+    优先级：push2 → 新浪 → 同花顺 → 东财 → 资金流排名 → 兜底
+    新增标签：🌡️弱势主线（15 ≤ 强度分 < 40）
     """
     rows, seen = [], set()
     status = "ok"
-    source_chain = []   # 记录成功源，用于诊断
+    source_chain = []
 
     # ① push2 直连
     try:
@@ -679,7 +688,7 @@ def get_sector_rotation(zt_df=None):
     except Exception as e:
         log(f"⚠ push2 异常: {e}", "WARN")
 
-    # ② 新浪行业（海外可访问）
+    # ② 新浪行业
     if not rows:
         try:
             d = _fetch_industry_from_sina()
@@ -691,7 +700,7 @@ def get_sector_rotation(zt_df=None):
         except Exception as e:
             log(f"⚠ 新浪异常: {e}", "WARN")
 
-    # ③ 同花顺 akshare
+    # ③ 同花顺
     if not rows:
         try:
             d = _fetch_industry_from_ths()
@@ -715,7 +724,7 @@ def get_sector_rotation(zt_df=None):
         except Exception as e:
             log(f"⚠ 东财异常: {e}", "WARN")
 
-    # ⑤ 5 日资金流排名（补 5 日口径）
+    # ⑤ 5 日资金流排名
     try:
         d = _fetch_fund_flow_rank()
         if d is not None and not d.empty:
@@ -757,7 +766,6 @@ def get_sector_rotation(zt_df=None):
         if has_real_pct:
             pct, kind = _get_pct(r)
             s = 0
-            # v6.0：区分 5 日和当日档位（当日 5% 是极端强势，5 日 5% 只是稳健）
             if kind == "当日":
                 if pct >= 3:     s += 30
                 elif pct >= 1.5: s += 20
@@ -776,17 +784,35 @@ def get_sector_rotation(zt_df=None):
     df["强度分"] = df.apply(calc_strength, axis=1)
 
     def label(r):
+        # 兜底模式
         if not has_real_pct:
             cnt = r.get("涨停家数", 0)
-            return "🔥强势主线" if cnt >= 3 else "📈升温中" if cnt >= 2 else "—"
-        if r["强度分"] >= 60 and (not has_net or r["主力净流入"] > 0):
-            return "🔥强势主线"
-        if r["强度分"] >= 40:
-            return "📈升温中"
-        if has_net and r["强度分"] < 0 and r["主力净流入"] < 0:
-            return "📉走弱"
+            seal = _to_num(r.get("封板资金合计", 0))
+            if cnt >= 3:
+                return "🔥强势主线"
+            elif cnt >= 2:
+                return "📈升温中"
+            elif cnt == 1 and seal >= FALLBACK_WEAK_SEAL:
+                return "🌡️弱势主线"
+            return "—"
+
+        # 真实数据模式（v6.1 五档分类）
+        s = r["强度分"]
+        net = r["主力净流入"] if has_net else 0
         pct, _ = _get_pct(r)
-        if has_net and pct > 3 and r["主力净流入"] < 0:
+
+        if s >= 60 and (not has_net or net > 0):
+            return "🔥强势主线"
+        if s >= 40:
+            return "📈升温中"
+        # v6.1 新增：弱势主线（有微弱涨幅，但资金不够/强度不够）
+        if WEAK_STRENGTH_LOW <= s < WEAK_STRENGTH_HIGH:
+            return "🌡️弱势主线"
+        # 明确撤退
+        if s < WEAK_STRENGTH_LOW and has_net and net < 0:
+            return "📉走弱"
+        # 脉冲（一日游风险）
+        if has_net and pct > 3 and net < 0:
             return "⚠️脉冲"
         return "—"
 
@@ -797,19 +823,21 @@ def get_sector_rotation(zt_df=None):
         sort_cols.append("主力净流入"); sort_asc.append(False)
     df = df.sort_values(sort_cols, ascending=sort_asc).reset_index(drop=True)
 
+    # 统计各标签数量
+    cnt_strong = int((df["状态"] == "🔥强势主线").sum())
+    cnt_warm   = int((df["状态"] == "📈升温中").sum())
+    cnt_weak   = int((df["状态"] == "🌡️弱势主线").sum())
+    cnt_down   = int((df["状态"] == "📉走弱").sum())
+
     calib = "5日" if has_5d else ("当日" if has_1d else "兜底")
     src_str = "+".join(source_chain) if source_chain else "无"
     log(f"✅ 板块主线分析完成: {len(df)} 个板块 | 源={src_str} | 口径={calib}")
+    log(f"   标签分布: 🔥{cnt_strong} 📈{cnt_warm} 🌡️{cnt_weak} 📉{cnt_down}")
     return df, status
 
 
 # ==================== 硬过滤 ====================
 def hard_filter(df):
-    """
-    v6.0 修正两个关键单位 bug：
-      - total_market_cap 单位是【元】，阈值【亿元】需 ×1e8
-      - seal_amount / circ_market_cap 都是【元】，比值不需要再乘 1e8
-    """
     if df.empty:
         return df, []
     original = len(df)
@@ -830,8 +858,6 @@ def hard_filter(df):
         if mask.any():
             reasons.append(f"换手>28%: {mask.sum()}只"); df = df[~mask]
 
-    # 一字板：封板资金 / 流通市值 > 8% 且未开板
-    # 【v6.0 修复】两列单位都是元，直接相除即可
     if HARD_FILTERS["one_word"] and "seal_amount" in df.columns and "circ_market_cap" in df.columns:
         circ = df["circ_market_cap"].replace(0, np.nan)
         ratio = df["seal_amount"] / circ
@@ -839,7 +865,6 @@ def hard_filter(df):
         if mask.any():
             reasons.append(f"一字板: {mask.sum()}只"); df = df[~mask]
 
-    # 市值过滤：【v6.0 修复】把阈值从"亿元"转成"元"再比
     if "total_market_cap" in df.columns:
         min_cap_yuan = HARD_FILTERS["min_market_cap"] * 1e8
         mask = df["total_market_cap"] < min_cap_yuan
@@ -941,6 +966,35 @@ def send_wecom_webhook(webhook_url, content):
     return False
 
 
+def _fmt_sector_line(r):
+    """格式化单行板块信息"""
+    p5 = _to_num(r.get("5日涨幅", 0))
+    p1 = _to_num(r.get("当日涨幅", 0))
+    net = _to_num(r.get("主力净流入", 0))
+    cnt = _to_int(r.get("涨停家数", 0))
+
+    if p5 != 0:
+        pct_str = f"5日{p5:+.1f}%"
+    elif p1 != 0:
+        pct_str = f"当日{p1:+.1f}%"
+    else:
+        pct_str = ""
+
+    net_str, is_out = fmt_net(net)
+    if net_str and is_out:
+        net_str = "资金" + net_str + " ↘"
+
+    if cnt > 0 and not pct_str:
+        seal = _to_num(r.get("封板资金合计", 0))
+        seal_str = f" | 封板合计{seal/1e8:.2f}亿" if seal > 0 else ""
+        return f"- {r['板块']} | 涨停{cnt}家{seal_str}（兜底口径）"
+
+    parts = [r['板块']]
+    if pct_str: parts.append(pct_str)
+    if net_str: parts.append(net_str)
+    return f"- {' | '.join(parts)}"
+
+
 def format_sector_section(sec_df, status):
     if sec_df is None or sec_df.empty:
         return "\n### 🌐 板块主线监测\n> ⚠️ 本次未取到任何板块数据，主线判断暂缺\n"
@@ -952,38 +1006,22 @@ def format_sector_section(sec_df, status):
     if is_fallback:
         msg += "> ⚠️ 数据置信度：低（无板块涨幅/资金流，仅按涨停家数聚合）\n"
 
+    # 🔥 强势主线
     strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(6)
     if not strong.empty:
-        msg += "\n**🔥 强势主线 / 涨停抱团**\n"
+        msg += "\n**🔥 强势主线**\n"
         for _, r in strong.iterrows():
-            p5 = _to_num(r.get("5日涨幅", 0))
-            p1 = _to_num(r.get("当日涨幅", 0))
-            net = _to_num(r.get("主力净流入", 0))
-            cnt = _to_int(r.get("涨停家数", 0))
-
-            if p5 != 0:
-                pct_str = f"5日{p5:+.1f}%"
-            elif p1 != 0:
-                pct_str = f"当日{p1:+.1f}%"
-            else:
-                pct_str = ""
-
-            if net != 0:
-                net_str = f"资金{net/1e8:+.2f}亿" if abs(net) >= 1e8 else f"资金{net/1e4:+.0f}万"
-            else:
-                net_str = ""
-
-            if cnt > 0 and not pct_str:
-                seal = _to_num(r.get("封板资金合计", 0))
-                seal_str = f" | 封板合计{seal/1e8:.2f}亿" if seal > 0 else ""
-                msg += f"- {r['板块']} | 涨停{cnt}家{seal_str}（兜底口径）\n"
-            else:
-                parts = [r['板块']]
-                if pct_str: parts.append(pct_str)
-                if net_str: parts.append(net_str)
-                msg += f"- {' | '.join(parts)}\n"
+            msg += _fmt_sector_line(r) + "\n"
     else:
-        msg += "> 暂无达到阈值的强势主线\n"
+        msg += "\n> 🔥 暂无达到阈值的强势主线\n"
+
+    # 🌡️ 弱势主线（v6.1 新增）
+    weak = sec_df[sec_df["状态"] == "🌡️弱势主线"].head(3)
+    if not weak.empty:
+        msg += "\n**🌡️ 衰退预警**（涨幅微弱、资金不足，可能是退潮主线）\n"
+        for _, r in weak.iterrows():
+            msg += _fmt_sector_line(r) + "\n"
+
     return msg
 
 
@@ -1034,7 +1072,7 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v6.0 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v6.1 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
         user_specified_threshold = args.min_score is not None
@@ -1059,7 +1097,7 @@ def main():
             log(f"✅ 板块TOP3: {' | '.join(top3_parts)}")
             _dump_debug(sec_df, "sector_rotation_result")
 
-        # 3. 板块统计（v6.0: tie-breaker 与 sec_df 保持一致）
+        # 3. 板块统计
         sector_counts = {}
         if "industry" in df_raw.columns:
             sector_counts = df_raw["industry"].value_counts().to_dict()
@@ -1085,7 +1123,6 @@ def main():
             if not args.no_ma and not _fund_circuit_broken:
                 get_kline(code)
 
-        # 5.5 v6.0 修复：探针只跑 PROBE_N 只，只要有失败即熔断
         if not args.no_fund and _fund_fail_count > 0 and not _fund_circuit_broken:
             _fund_circuit_broken = True
             _fund_fast_fail = True
