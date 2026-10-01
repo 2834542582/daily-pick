@@ -24,11 +24,12 @@ on:
         default: ''
         type: string
   schedule:
-    - cron: '55 6 * * 1-5'
-    - cron: '5 7 * * 1-5'
-    - cron: '30 8 * * 1-5'
-    - cron: '0 12 * * 1-5'
-    - cron: '50 0 * * 1-6'
+    # 全部时间为 UTC，实际触发 ≈ 北京时间 = UTC + 8
+    # 【重要】GitHub Actions 的 cron 有 5~30 分钟延迟，为常态
+    - cron: '30 7 * * 1-5'   # UTC 07:30 = 北京 15:30 | 收盘即报（快速，不含均线）
+    - cron: '0 8 * * 1-5'    # UTC 08:00 = 北京 16:00 | 盘后完整复盘【主推送】
+    - cron: '0 12 * * 1-5'   # UTC 12:00 = 北京 20:00 | 晚间复盘（无资金）
+    - cron: '50 0 * * 1-6'   # UTC 00:50 = 北京 08:50 | 保活心跳
 
 permissions:
   contents: write
@@ -45,6 +46,7 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
       OUTPUT_DIR: results
+      TZ: Asia/Shanghai   # 让脚本内 datetime.now() 显示北京时间
 
     steps:
       - uses: actions/checkout@v4
@@ -68,12 +70,11 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             case "${{ github.event.schedule }}" in
-              '55 6 * * 1-5')  MODE=fast;     TAG="收盘前速报";;
-              '5 7 * * 1-5')   MODE=fast;     TAG="收盘即报";;
-              '30 8 * * 1-5')  MODE=full;     TAG="盘后完整复盘";;
-              '0 12 * * 1-5')  MODE=no_fund;  TAG="尾盘二次确认";;
+              '30 7 * * 1-5')  MODE=fast;      TAG="收盘即报";;
+              '0 8 * * 1-5')   MODE=full;      TAG="盘后完整复盘";;
+              '0 12 * * 1-5')  MODE=no_fund;   TAG="晚间复盘";;
               '50 0 * * 1-6')  MODE=keepalive; TAG="保活心跳";;
-              *)               MODE=fast;     TAG="未知时段-默认fast";;
+              *)               MODE=fast;      TAG="未知时段-默认fast";;
             esac
           else
             MODE=${{ inputs.mode || 'full' }}
@@ -111,6 +112,7 @@ jobs:
       - name: 回存选股结果到仓库
         if: steps.meta.outputs.mode != 'keepalive'
         run: |
+          git config user.name  "github-actions[bot]"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add results/ keepalive.txt 2>/dev/null || true
