@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 v7.2 —— 早晚双推 + 三段式主线
+每日选股推送 v7.3 —— 修复涨停池快速失败
 ===========================================================
-v7.2 相对 v7.1 的改动：
-  【修复】
-  1) 板块主线三段式：🔥强势 + 📈升温 + 📉走弱
-  2) 早盘提醒节后降级（不直接跳过，改为精简提醒）
-  3) hits 里资金显示具体金额（不再只显示"+"）
-  4) 主线监控标注数据源（新浪/东财，是否有资金流）
-  5) 企微消息超长检查 + 截断（防静默丢弃）
-  6) 数据日 != 今天时日志告警
-  7) brief 模式读 CSV 加 dtype={"code": str}（防前导0丢失）
-  8) brief 模式空候选分支
+v7.3 相对 v7.2 的改动：
+  1) 涨停池独立重试（3次，间隔2s）— 修复"9/30超时跳到9/29"的bug
+  2) SCORE_TIME_BUDGET 120 → 180（新浪源响应慢）
+  3) 交易日历缓存（减少重复请求）
 
-v7.1 保留：
-  - 双源架构（东财优先 → 新浪回退）
-  - 市场温度（涨停+梯队+炸板率）
-  - 交易日过滤（定时触发时跳过非交易日）
-  - 探针即熔断东财
-  - --brief 模式（读历史 CSV）
-
-推送时间表：
-  - 北京 16:00 工作日 → 主推送
-  - 北京 08:50 工作日次日 → 早盘提醒
-  - 北京 09:00 周日 → 保活
+v7.2 保留：
+  - 三段式主线（🔥强势 + 📈升温 + 📉走弱）
+  - 企微消息长度检查
+  - 早盘提醒长假降级
+  - 双源架构（东财 → 新浪）
+  - 数据日≠今日告警
 ===========================================================
 """
 # ==================== requests 超时补丁 ====================
@@ -77,9 +66,13 @@ KLINE_FAIL_THRESHOLD = 3
 DEFAULT_MIN_SCORE = 75
 DEGRADED_MIN_SCORE = 55
 
-SCORE_TIME_BUDGET = 120
+SCORE_TIME_BUDGET = 180   # v7.3: 120 → 180
 SLOW_CALL_THRESHOLD = 3.0
 SLOW_CALL_MAX = 5
+
+# v7.3: 涨停池独立重试参数
+ZT_RETRY_COUNT = 3
+ZT_RETRY_DELAY = 2
 
 WEAK_STRENGTH_LOW = 10
 WEAK_STRENGTH_HIGH = 40
@@ -90,8 +83,8 @@ TEMP_HOT = 75
 TEMP_WARM = 55
 TEMP_COLD = 35
 
-BRIEF_MAX_DAYS = 15      # v7.2: 5 → 15，允许跨长假
-WECOM_MAX_BYTES = 4000   # 企微 markdown 上限约 4096 字节，留余量
+BRIEF_MAX_DAYS = 15
+WECOM_MAX_BYTES = 4000
 
 HARD_FILTERS = {
     "st": True, "max_boards": 3, "max_turnover": 28.0,
@@ -122,6 +115,7 @@ _kline_fast_fail = False
 _slow_fund_calls = 0
 _slow_kline_calls = 0
 _trade_calendar_cache = None
+_recent_trade_dates_cache = None   # v7.3
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -200,7 +194,6 @@ def fmt_net(net_yuan):
 
 
 def fmt_money_short(yuan_val):
-    """简短金额显示：+1234万 / +1.5亿"""
     n = _to_num(yuan_val)
     if n == 0:
         return ""
@@ -290,6 +283,10 @@ def calc_next_trade_date(used_date_str):
 
 
 def _get_recent_trade_dates(n=10):
+    """v7.3: 加缓存"""
+    global _recent_trade_dates_cache
+    if _recent_trade_dates_cache is not None:
+        return _recent_trade_dates_cache[:n]
     try:
         import akshare as ak
         cal = retry_with_backoff(ak.tool_trade_date_hist_sina)
@@ -299,7 +296,8 @@ def _get_recent_trade_dates(n=10):
         cal["trade_date"] = pd.to_datetime(cal["trade_date"])
         cal = cal[cal["trade_date"] <= pd.Timestamp.today()]
         cal = cal.sort_values("trade_date", ascending=False)
-        return [d.strftime("%Y%m%d") for d in cal["trade_date"].head(n)]
+        _recent_trade_dates_cache = [d.strftime("%Y%m%d") for d in cal["trade_date"].head(20)]
+        return _recent_trade_dates_cache[:n]
     except Exception:
         return []
 
@@ -329,8 +327,30 @@ def _normalize(df, used_date):
     return df
 
 
-def get_limit_up_pool(trade_date=None):
+def _fetch_zt_pool_robust(date_str):
+    """
+    v7.3: 涨停池独立重试函数。
+    不采用"快速失败"，因为这是最关键的数据。
+    至少尝试 ZT_RETRY_COUNT 次，间隔 ZT_RETRY_DELAY 秒。
+    返回 DataFrame 或 None。
+    """
     import akshare as ak
+    for attempt in range(ZT_RETRY_COUNT):
+        try:
+            df = ak.stock_zt_pool_em(date_str)
+            if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        except Exception as e:
+            err_str = str(e)
+            if attempt < ZT_RETRY_COUNT - 1:
+                log(f"⏳ 涨停池 {date_str} 第{attempt+1}次失败，等{ZT_RETRY_DELAY}s重试: {err_str[:60]}", "WARN")
+                time.sleep(ZT_RETRY_DELAY)
+            else:
+                log(f"🚫 涨停池 {date_str} 连续{ZT_RETRY_COUNT}次失败: {err_str[:60]}", "WARN")
+    return None
+
+
+def get_limit_up_pool(trade_date=None):
     if trade_date:
         candidates = [trade_date]
         log(f"📡 获取涨停池: 指定日期 {trade_date}")
@@ -344,8 +364,9 @@ def get_limit_up_pool(trade_date=None):
             candidates = [today]
 
     for cand in candidates:
-        df = retry_with_backoff(ak.stock_zt_pool_em, cand)
-        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        # v7.3: 用独立重试函数，不再用快速失败的 retry_with_backoff
+        df = _fetch_zt_pool_robust(cand)
+        if df is None:
             continue
         log(f"✅ 涨停池命中 {cand}: {len(df)} 只")
         _dump_debug(df, f"ztpool_ok_{cand}")
@@ -823,7 +844,6 @@ def get_sector_rotation(zt_df=None):
     n_d = int((df["状态"] == "📉走弱").sum())
     log(f"✅ 板块主线: {len(df)} 个 | 源={src} | 口径={calib} | 🔥{n_s} 📈{n_w} 🌡️{n_k} 📉{n_d}")
 
-    # v7.2: 记录元信息供推送使用
     df.attrs["has_net"] = has_net
     df.attrs["source"] = src
     df.attrs["calib"] = calib
@@ -934,7 +954,6 @@ def score_stock(row, sector_counts, use_fund, use_ma):
         n5, n10 = get_fund_flow(str(row.get("code", "")).zfill(6))
         if n5 > 0:
             s = min(int(n5 / 1000), w["fund_flow_5d"]); score += s
-            # v7.2: 显示具体金额
             hits.append(f"5日资金{fmt_money_short(n5)}")
         if n10 > 0:
             s = min(int(n10 / 2000), w["fund_flow_10d"]); score += s
@@ -984,21 +1003,15 @@ def score_stock(row, sector_counts, use_fund, use_ma):
 
 # ==================== 推送基础 ====================
 def send_wecom_webhook(url, content):
-    """
-    发送到企微。v7.2: 检查长度，超 4000 字节则截断
-    """
     if not url:
         log("⚠ WECOM_WEBHOOK 未配置", "WARN")
         return False
 
-    # v7.2: 长度检查
     content_bytes = len(content.encode("utf-8"))
     if content_bytes > WECOM_MAX_BYTES:
         log(f"⚠ 消息 {content_bytes} 字节 > {WECOM_MAX_BYTES} 上限，截断", "WARN")
-        # 按字节截断（保留完整行）
         encoded = content.encode("utf-8")
         truncated = encoded[:WECOM_MAX_BYTES].decode("utf-8", errors="ignore")
-        # 找到最后一个换行符，保证行完整
         last_nl = truncated.rfind("\n")
         if last_nl > WECOM_MAX_BYTES * 0.5:
             truncated = truncated[:last_nl]
@@ -1051,7 +1064,7 @@ def _fmt_sector_line(r):
     return f"- {' | '.join(parts)}"
 
 
-# ==================== 主推送格式化（v7.2 三段式）====================
+# ==================== 主推送格式化 ====================
 def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
                         min_score_used, is_degraded, temp, temp_detail):
     now = datetime.now().strftime("%m-%d %H:%M")
@@ -1077,22 +1090,18 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
     msg += f"连板 {temp_detail['连板家数']} 家 | 炸板率 {temp_detail['炸板率']}\n"
     msg += f"> **{advice}**\n"
 
-    # ============ 主线监控（v7.2 三段式）============
     if sec_df is not None and not sec_df.empty:
         msg += f"\n### 🌐 主线监控\n"
 
-        # 数据源标注
         is_fallback = sec_status and "兜底" in str(sec_status)
         has_net = sec_df.attrs.get("has_net", False)
         src = sec_df.attrs.get("source", "")
-        calib = sec_df.attrs.get("calib", "")
 
         if is_fallback:
             msg += "> ⚠️ 兜底口径（仅按涨停家数聚合，无涨幅/资金）\n"
         elif not has_net:
             msg += f"> ℹ️ 数据源={src} | 无资金流数据\n"
 
-        # ① 强势主线
         strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(5)
         if not strong.empty:
             msg += "\n**🔥 强势主线（资金抱团）**\n"
@@ -1101,14 +1110,12 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
         else:
             msg += "\n**🔥 强势主线**：暂无，市场分散\n"
 
-        # ② 升温中（v7.2 新增）
         warm = sec_df[sec_df["状态"] == "📈升温中"].head(5)
         if not warm.empty:
             msg += "\n**📈 升温中（值得跟踪）**\n"
             for _, r in warm.iterrows():
                 msg += _fmt_sector_line(r) + "\n"
 
-        # ③ 走弱预警（v7.2 改为显示 📉走弱，而不是 🌡️弱势主线）
         down = sec_df[sec_df["状态"] == "📉走弱"].head(3)
         if not down.empty:
             msg += "\n**📉 走弱预警（资金撤离）**\n"
@@ -1117,7 +1124,6 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
     else:
         msg += "\n### 🌐 主线监控\n> ⚠️ 本次未取到板块数据\n"
 
-    # ============ 候选标的 ============
     msg += f"\n### 🏆 候选标的（{len(df)}只）\n"
     if temp < TEMP_COLD:
         msg += "> ❄️ 市场冰冻，建议空仓观望\n"
@@ -1139,7 +1145,6 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
             if hits:
                 msg += f"> 亮点：{' · '.join(hits[:4])}\n"
 
-    # ============ 操作建议 ============
     if temp >= TEMP_HOT:
         no_chase, half_tp, clear_tp = 7.0, 8.0, 12.0
     elif temp >= TEMP_WARM:
@@ -1160,7 +1165,7 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
     return msg
 
 
-# ==================== 早盘提醒格式化（v7.2 改进）====================
+# ==================== 早盘提醒格式化 ====================
 def format_brief_message(df, data_date, days_diff, has_data=True):
     now = datetime.now().strftime("%m-%d %H:%M")
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -1169,10 +1174,8 @@ def format_brief_message(df, data_date, days_diff, has_data=True):
     msg += f"**数据日**: {data_date.strftime('%Y-%m-%d')}（{days_diff}天前）\n"
     msg += f"**今日**: {today_str}\n"
 
-    # v7.2: 数据过期提示
     if days_diff > 10:
         msg += f"> ⚠️ **数据已过期 {days_diff} 天**（跨长假），仅供参考，请以今日盘面为准\n"
-        # 长假后不展示候选股，只提示
         msg += f"\n### ⚠️ 长假后特别提示\n"
         msg += f"- 隔夜消息面可能剧变，昨日候选股**不建议直接执行**\n"
         msg += f"- 开盘先观察 15 分钟，看大盘和主线方向\n"
@@ -1188,7 +1191,6 @@ def format_brief_message(df, data_date, days_diff, has_data=True):
     if days_diff > 3:
         msg += f"> ℹ️ 数据为 {days_diff} 天前，留意消息面\n"
 
-    # 候选股
     msg += f"\n### 🎯 今日候选\n"
     if not has_data or df.empty:
         msg += "> 昨日无符合标的，建议空仓观望\n"
@@ -1218,7 +1220,7 @@ def format_brief_message(df, data_date, days_diff, has_data=True):
     return msg
 
 
-# ==================== 早盘提醒模式（v7.2 改进）====================
+# ==================== 早盘提醒模式 ====================
 def run_brief_mode():
     now = datetime.now()
     today_str = now.strftime("%Y%m%d")
@@ -1261,7 +1263,6 @@ def run_brief_mode():
     has_data = True
     df = pd.DataFrame()
     try:
-        # v7.2: 指定 code 为 str，防前导 0 丢失
         df = pd.read_csv(csv_path, dtype={"code": str})
         if df.empty:
             has_data = False
@@ -1288,7 +1289,6 @@ def run_full_mode(args):
             "## ⚠️ 选股未执行\n**原因**: 最近交易日无涨停数据")
         return
 
-    # v7.2: 数据日 != 今天时告警
     used_date = df_raw.attrs.get("used_date", "")
     today_str = datetime.now().strftime("%Y%m%d")
     if used_date and used_date != today_str:
@@ -1362,7 +1362,7 @@ def run_full_mode(args):
         log(f"⚠️ 降级模式，阈值→{min_score}")
 
     # 8. 评分
-    log(f"📝 评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'} 阈值={min_score}）...")
+    log(f"📝 评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'} 阈值={min_score} 预算={SCORE_TIME_BUDGET}s）...")
     t0 = time.time()
     budget_hit = False
     scores, maxes, norms, hits_list = [], [], [], []
@@ -1428,7 +1428,7 @@ def main():
     today_str = datetime.now().strftime("%Y%m%d")
 
     if args.brief:
-        log(f"🚀 启动 v7.2 | 模式=brief | 定时={is_scheduled}")
+        log(f"🚀 启动 v7.3 | 模式=brief | 定时={is_scheduled}")
         if is_scheduled and not is_trade_date(today_str):
             log(f"📅 {today_str} 非交易日，跳过早盘提醒")
             return
@@ -1449,7 +1449,7 @@ def main():
     else:
         mode = "full"
 
-    log(f"🚀 启动 v7.2 | 模式={mode} | 定时={is_scheduled}")
+    log(f"🚀 启动 v7.3 | 模式={mode} | 定时={is_scheduled}")
 
     if is_scheduled and not is_trade_date(today_str):
         log(f"📅 {today_str} 非交易日，跳过主推送")
