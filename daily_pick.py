@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 v7.1 —— 早晚双推
+每日选股推送 v7.2 —— 早晚双推 + 三段式主线
 ===========================================================
-两个模式：
-  1. 主推送（默认，16:00 运行）
-     - 全量选股 + 主线监控 + 候选股 + 操作建议
-  2. 早盘提醒（--brief，08:50 运行）
-     - 读最近 CSV，只提醒 + 竞价规则
+v7.2 相对 v7.1 的改动：
+  【修复】
+  1) 板块主线三段式：🔥强势 + 📈升温 + 📉走弱
+  2) 早盘提醒节后降级（不直接跳过，改为精简提醒）
+  3) hits 里资金显示具体金额（不再只显示"+"）
+  4) 主线监控标注数据源（新浪/东财，是否有资金流）
+  5) 企微消息超长检查 + 截断（防静默丢弃）
+  6) 数据日 != 今天时日志告警
+  7) brief 模式读 CSV 加 dtype={"code": str}（防前导0丢失）
+  8) brief 模式空候选分支
 
-日期过滤（定时触发时生效，手动触发不过滤）：
-  - 主推送：今天非交易日 → 直接退出
-  - 早盘提醒：今天非交易日 → 直接退出
-  - 避免节假日重复推送
+v7.1 保留：
+  - 双源架构（东财优先 → 新浪回退）
+  - 市场温度（涨停+梯队+炸板率）
+  - 交易日过滤（定时触发时跳过非交易日）
+  - 探针即熔断东财
+  - --brief 模式（读历史 CSV）
 
-数据源优先级：
-  - 板块：push2 → 新浪 → 兜底
-  - 个股资金流：东财 → 新浪
-  - K线：东财 → 新浪
+推送时间表：
+  - 北京 16:00 工作日 → 主推送
+  - 北京 08:50 工作日次日 → 早盘提醒
+  - 北京 09:00 周日 → 保活
 ===========================================================
 """
 # ==================== requests 超时补丁 ====================
@@ -83,7 +90,8 @@ TEMP_HOT = 75
 TEMP_WARM = 55
 TEMP_COLD = 35
 
-BRIEF_MAX_DAYS = 5   # 早盘提醒的 CSV 有效期（天）
+BRIEF_MAX_DAYS = 15      # v7.2: 5 → 15，允许跨长假
+WECOM_MAX_BYTES = 4000   # 企微 markdown 上限约 4096 字节，留余量
 
 HARD_FILTERS = {
     "st": True, "max_boards": 3, "max_turnover": 28.0,
@@ -191,6 +199,16 @@ def fmt_net(net_yuan):
     return f"{n/1e4:+.0f}万", n < 0
 
 
+def fmt_money_short(yuan_val):
+    """简短金额显示：+1234万 / +1.5亿"""
+    n = _to_num(yuan_val)
+    if n == 0:
+        return ""
+    if abs(n) >= 1e8:
+        return f"{n/1e8:+.1f}亿"
+    return f"{n/1e4:+.0f}万"
+
+
 def _find_col(df, *keywords):
     for c in df.columns:
         for kw in keywords:
@@ -223,7 +241,6 @@ def is_late_afternoon(ftime_str):
 
 # ==================== 交易日历 ====================
 def _get_trade_calendar():
-    """返回交易日集合（YYYYMMDD 字符串），失败返回 None"""
     global _trade_calendar_cache
     if _trade_calendar_cache is not None:
         return _trade_calendar_cache
@@ -241,7 +258,6 @@ def _get_trade_calendar():
 
 
 def is_trade_date(date_str):
-    """判断是否交易日。日历不可用时仅判断周末。"""
     cal = _get_trade_calendar()
     if cal:
         return date_str in cal
@@ -253,7 +269,6 @@ def is_trade_date(date_str):
 
 
 def calc_next_trade_date(used_date_str):
-    """从数据日推算下一交易日（跳周末 + 跳节假日）"""
     if not used_date_str or len(used_date_str) != 8:
         return "下一交易日"
     try:
@@ -807,6 +822,11 @@ def get_sector_rotation(zt_df=None):
     n_k = int((df["状态"] == "🌡️弱势主线").sum())
     n_d = int((df["状态"] == "📉走弱").sum())
     log(f"✅ 板块主线: {len(df)} 个 | 源={src} | 口径={calib} | 🔥{n_s} 📈{n_w} 🌡️{n_k} 📉{n_d}")
+
+    # v7.2: 记录元信息供推送使用
+    df.attrs["has_net"] = has_net
+    df.attrs["source"] = src
+    df.attrs["calib"] = calib
     return df, "ok"
 
 
@@ -914,7 +934,8 @@ def score_stock(row, sector_counts, use_fund, use_ma):
         n5, n10 = get_fund_flow(str(row.get("code", "")).zfill(6))
         if n5 > 0:
             s = min(int(n5 / 1000), w["fund_flow_5d"]); score += s
-            hits.append("5日资金+")
+            # v7.2: 显示具体金额
+            hits.append(f"5日资金{fmt_money_short(n5)}")
         if n10 > 0:
             s = min(int(n10 / 2000), w["fund_flow_10d"]); score += s
 
@@ -963,9 +984,27 @@ def score_stock(row, sector_counts, use_fund, use_ma):
 
 # ==================== 推送基础 ====================
 def send_wecom_webhook(url, content):
+    """
+    发送到企微。v7.2: 检查长度，超 4000 字节则截断
+    """
     if not url:
         log("⚠ WECOM_WEBHOOK 未配置", "WARN")
         return False
+
+    # v7.2: 长度检查
+    content_bytes = len(content.encode("utf-8"))
+    if content_bytes > WECOM_MAX_BYTES:
+        log(f"⚠ 消息 {content_bytes} 字节 > {WECOM_MAX_BYTES} 上限，截断", "WARN")
+        # 按字节截断（保留完整行）
+        encoded = content.encode("utf-8")
+        truncated = encoded[:WECOM_MAX_BYTES].decode("utf-8", errors="ignore")
+        # 找到最后一个换行符，保证行完整
+        last_nl = truncated.rfind("\n")
+        if last_nl > WECOM_MAX_BYTES * 0.5:
+            truncated = truncated[:last_nl]
+        truncated += "\n\n> ✂️ 内容过长已截断，完整数据见 CSV"
+        content = truncated
+
     try:
         import urllib.request
         req = urllib.request.Request(
@@ -998,6 +1037,8 @@ def _fmt_sector_line(r):
     net_str, is_out = fmt_net(net)
     if net_str and is_out:
         net_str = "资金" + net_str + " ↘"
+    elif net_str:
+        net_str = "资金" + net_str
 
     if cnt > 0 and not pct_str:
         seal = _to_num(r.get("封板资金合计", 0))
@@ -1010,7 +1051,7 @@ def _fmt_sector_line(r):
     return f"- {' | '.join(parts)}"
 
 
-# ==================== 主推送格式化 ====================
+# ==================== 主推送格式化（v7.2 三段式）====================
 def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
                         min_score_used, is_degraded, temp, temp_detail):
     now = datetime.now().strftime("%m-%d %H:%M")
@@ -1036,27 +1077,47 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
     msg += f"连板 {temp_detail['连板家数']} 家 | 炸板率 {temp_detail['炸板率']}\n"
     msg += f"> **{advice}**\n"
 
+    # ============ 主线监控（v7.2 三段式）============
     if sec_df is not None and not sec_df.empty:
         msg += f"\n### 🌐 主线监控\n"
-        if sec_status and "兜底" in str(sec_status):
-            msg += "> ⚠️ 兜底口径（无板块涨幅/资金）\n"
 
+        # 数据源标注
+        is_fallback = sec_status and "兜底" in str(sec_status)
+        has_net = sec_df.attrs.get("has_net", False)
+        src = sec_df.attrs.get("source", "")
+        calib = sec_df.attrs.get("calib", "")
+
+        if is_fallback:
+            msg += "> ⚠️ 兜底口径（仅按涨停家数聚合，无涨幅/资金）\n"
+        elif not has_net:
+            msg += f"> ℹ️ 数据源={src} | 无资金流数据\n"
+
+        # ① 强势主线
         strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(5)
         if not strong.empty:
-            msg += "\n**🔥 强势主线**\n"
+            msg += "\n**🔥 强势主线（资金抱团）**\n"
             for _, r in strong.iterrows():
                 msg += _fmt_sector_line(r) + "\n"
         else:
-            msg += "\n> 🔥 暂无强势主线\n"
+            msg += "\n**🔥 强势主线**：暂无，市场分散\n"
 
-        weak = sec_df[sec_df["状态"] == "🌡️弱势主线"].head(3)
-        if not weak.empty:
-            msg += "\n**🌡️ 走弱预警**\n"
-            for _, r in weak.iterrows():
+        # ② 升温中（v7.2 新增）
+        warm = sec_df[sec_df["状态"] == "📈升温中"].head(5)
+        if not warm.empty:
+            msg += "\n**📈 升温中（值得跟踪）**\n"
+            for _, r in warm.iterrows():
+                msg += _fmt_sector_line(r) + "\n"
+
+        # ③ 走弱预警（v7.2 改为显示 📉走弱，而不是 🌡️弱势主线）
+        down = sec_df[sec_df["状态"] == "📉走弱"].head(3)
+        if not down.empty:
+            msg += "\n**📉 走弱预警（资金撤离）**\n"
+            for _, r in down.iterrows():
                 msg += _fmt_sector_line(r) + "\n"
     else:
         msg += "\n### 🌐 主线监控\n> ⚠️ 本次未取到板块数据\n"
 
+    # ============ 候选标的 ============
     msg += f"\n### 🏆 候选标的（{len(df)}只）\n"
     if temp < TEMP_COLD:
         msg += "> ❄️ 市场冰冻，建议空仓观望\n"
@@ -1078,6 +1139,7 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
             if hits:
                 msg += f"> 亮点：{' · '.join(hits[:4])}\n"
 
+    # ============ 操作建议 ============
     if temp >= TEMP_HOT:
         no_chase, half_tp, clear_tp = 7.0, 8.0, 12.0
     elif temp >= TEMP_WARM:
@@ -1098,8 +1160,8 @@ def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
     return msg
 
 
-# ==================== 早盘提醒格式化（v7.1 新增）====================
-def format_brief_message(df, data_date, days_diff):
+# ==================== 早盘提醒格式化（v7.2 改进）====================
+def format_brief_message(df, data_date, days_diff, has_data=True):
     now = datetime.now().strftime("%m-%d %H:%M")
     today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -1107,13 +1169,28 @@ def format_brief_message(df, data_date, days_diff):
     msg += f"**数据日**: {data_date.strftime('%Y-%m-%d')}（{days_diff}天前）\n"
     msg += f"**今日**: {today_str}\n"
 
+    # v7.2: 数据过期提示
+    if days_diff > 10:
+        msg += f"> ⚠️ **数据已过期 {days_diff} 天**（跨长假），仅供参考，请以今日盘面为准\n"
+        # 长假后不展示候选股，只提示
+        msg += f"\n### ⚠️ 长假后特别提示\n"
+        msg += f"- 隔夜消息面可能剧变，昨日候选股**不建议直接执行**\n"
+        msg += f"- 开盘先观察 15 分钟，看大盘和主线方向\n"
+        msg += f"- 有隔夜利好的板块，找低位补涨；无主线，等确定性机会\n"
+        msg += f"\n### ⚙️ 通用竞价规则\n"
+        msg += f"- 高开 >5%：**不追**\n"
+        msg += f"- 高开 2~5%：**半仓**\n"
+        msg += f"- 高开 0~2%：**正常仓**\n"
+        msg += f"- 低开 >2%：**放弃**\n"
+        msg += f"\n> 💡 长假后第一天，仓位保守为上"
+        return msg
+
     if days_diff > 3:
-        msg += f"> ⚠️ **数据已过期 {days_diff} 天**，隔夜消息面可能有变，谨慎参考\n"
-    elif days_diff > 1:
         msg += f"> ℹ️ 数据为 {days_diff} 天前，留意消息面\n"
 
+    # 候选股
     msg += f"\n### 🎯 今日候选\n"
-    if df.empty:
+    if not has_data or df.empty:
         msg += "> 昨日无符合标的，建议空仓观望\n"
     else:
         for i, (_, r) in enumerate(df.head(8).iterrows(), 1):
@@ -1141,7 +1218,7 @@ def format_brief_message(df, data_date, days_diff):
     return msg
 
 
-# ==================== 早盘提醒模式（v7.1 新增）====================
+# ==================== 早盘提醒模式（v7.2 改进）====================
 def run_brief_mode():
     now = datetime.now()
     today_str = now.strftime("%Y%m%d")
@@ -1157,7 +1234,6 @@ def run_brief_mode():
         log("⚠ 无 results 目录", "WARN")
         return
 
-    # 找最近的 full 模式 CSV
     csvs = sorted(
         [f for f in os.listdir(out_dir)
          if f.startswith("pick_") and f.endswith("_full.csv")],
@@ -1182,13 +1258,18 @@ def run_brief_mode():
 
     log(f"📂 读取 {latest}（{days_diff} 天前）")
     csv_path = os.path.join(out_dir, latest)
+    has_data = True
+    df = pd.DataFrame()
     try:
-        df = pd.read_csv(csv_path)
+        # v7.2: 指定 code 为 str，防前导 0 丢失
+        df = pd.read_csv(csv_path, dtype={"code": str})
+        if df.empty:
+            has_data = False
     except Exception as e:
         log(f"⚠ 读取 CSV 失败: {e}", "WARN")
-        return
+        has_data = False
 
-    msg = format_brief_message(df, data_date, days_diff)
+    msg = format_brief_message(df, data_date, days_diff, has_data=has_data)
     send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""), msg)
     log("✅ 早盘提醒完成")
 
@@ -1206,6 +1287,12 @@ def run_full_mode(args):
         send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
             "## ⚠️ 选股未执行\n**原因**: 最近交易日无涨停数据")
         return
+
+    # v7.2: 数据日 != 今天时告警
+    used_date = df_raw.attrs.get("used_date", "")
+    today_str = datetime.now().strftime("%Y%m%d")
+    if used_date and used_date != today_str:
+        log(f"⚠ 数据日 {used_date} != 今日 {today_str}（可能非交易日或日历延迟）", "WARN")
 
     # 2. 市场温度
     temp, temp_detail = calc_market_temperature(df_raw)
@@ -1248,7 +1335,6 @@ def run_full_mode(args):
             if kl is not None and not kl.empty:
                 probe_kline_ok = True
 
-    # 探针后：东财已证不可用 → 直接熔断，评分全走新浪
     if not args.no_fund:
         if not probe_fund_ok:
             _fund_fast_fail = True
@@ -1316,7 +1402,6 @@ def run_full_mode(args):
         cols = [c for c in ["code", "name", "score", "raw_score", "max_score",
                              "industry", "board_count", "turnover", "total_market_cap"]
                 if c in df_f.columns]
-        used_date = df_raw.attrs.get("used_date", datetime.now().strftime("%Y%m%d"))
         csv_path = f"{out_dir}/pick_{used_date}_full.csv"
         df_f[cols].to_csv(csv_path, index=False, encoding="utf-8-sig")
         log(f"💾 已保存 {len(df_f)}只 → {csv_path}")
@@ -1342,9 +1427,8 @@ def main():
     is_scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule"
     today_str = datetime.now().strftime("%Y%m%d")
 
-    # 早盘提醒模式
     if args.brief:
-        log(f"🚀 启动 v7.1 | 模式=brief | 定时={is_scheduled}")
+        log(f"🚀 启动 v7.2 | 模式=brief | 定时={is_scheduled}")
         if is_scheduled and not is_trade_date(today_str):
             log(f"📅 {today_str} 非交易日，跳过早盘提醒")
             return
@@ -1356,7 +1440,6 @@ def main():
             sys.exit(1)
         return
 
-    # 主推送模式
     if args.no_ma and args.no_fund:
         mode = "fast"
     elif args.no_fund:
@@ -1366,9 +1449,8 @@ def main():
     else:
         mode = "full"
 
-    log(f"🚀 启动 v7.1 | 模式={mode} | 定时={is_scheduled}")
+    log(f"🚀 启动 v7.2 | 模式={mode} | 定时={is_scheduled}")
 
-    # 主推送也做交易日过滤（避免节假日重复推送）
     if is_scheduled and not is_trade_date(today_str):
         log(f"📅 {today_str} 非交易日，跳过主推送")
         return
