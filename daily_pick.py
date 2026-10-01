@@ -1,103 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v6.5
+每日选股推送 v7.0 —— 精简版
 ===========================================================
-v6.5 相对 v6.4 的改动：
-  【时间语义修复】
-  1) 推送头部明确区分"数据日 / 建议日 / 生成时间"
-     - 数据日：涨停池、资金流、K线对应的交易日
-     - 建议日：下一交易日（自动跳过周末）
-     - 生成时间：脚本实际运行时刻（北京时间）
-  2) 建议日自动跳过周末，遇到周五数据推送时提示"下周一"
-  3) 提醒用户"数据为日终快照，非盘中实时数据"
+只做四件事：
+  1. 每日推送
+  2. 主线监控（强势 + 走弱预警）
+  3. 候选股（含评分）
+  4. 操作建议
 
-  【新浪源适配】
-  4) 检测到无资金流数据时，推送里明确提示"数据源=新浪行业，无资金流"
-  5) 无资金流时，"强势主线"门槛从 60 降到 50（避免全部落在🌡️弱势）
+砍掉：
+  - 因子归因（只写 CSV，不进推送）
+  - 冗长的次日操作计划（精简成 4 行）
+  - 调试信息外泄到推送
 
-  【保留 v6.4 特性】
-  - 双源架构 + 独立计数器（东财失败不被新浪清零）
-  - 探针后立即熔断东财，评分阶段全走新浪
-  - 次日操作计划（卖出规则）
-  - 因子归因
-  - 市场温度择时
-
-===========================================================
-数据口径速查：
------------------------------------------------------------
-【涨停池 stock_zt_pool_em / 东财】
-  日终数据（收盘后 15:10~15:30 刷新）；
-  连板数含当日（首板=1）；换手率为当日（%）；
-  市值/封板资金/成交额单位【元】；
-  首次封板时间 HHMMSS；炸板次数=0 未开板；所属行业为东财口径。
-
-【资金流 双源】
-  东财 stock_individual_fund_flow：主力净流入 = 超大单+大单（元）
-  新浪 MoneyFlow.ssl_qsfx_zjlrqs：netamount = 主力净流入（元）
-  本脚本用「近5日累计 / 近10日累计」，单位【元】
-
-【K线 双源】
-  东财 stock_zh_a_hist：前复权（adjust="qfq"）
-  新浪 CN_MarketData.getKLineData：不复权（scale=240 日线）
-  短期（60日）内不复权与复权差异极小，均线判断可接受
-
-【板块主线】
-  push2     : f3=当日涨幅(%)，f62=当日主力净流入(元)
-  新浪行业  : 涨跌幅(%) + 成交额(万元)，**无资金流**
-  同花顺/东财 akshare : 涨跌幅 + 主力净流入
-  兜底      : 仅涨停家数 + 封板资金
-
-【板块标签】
-  🔥强势主线 : 强度分≥60（无资金流时≥50）且（无资金或资金>0）
-  📈升温中   : 40≤强度分<60
-  🌡️弱势主线 : 10≤强度分<40
-  📉走弱     : 强度分<10 且 资金<0
-  ⚠️脉冲     : 涨幅>3 且 资金<0
-
-【市场温度】
-  涨停家数分（满分 40）+ 连板梯队分（满分 30）+ 炸板率分（满分 30）
-  ≥75 热     : 满仓 / 竞价高开>7%不追 / 止盈+8%减半
-  55~75 温   : 半仓 / 竞价高开>5%不追 / 止盈+5%减半
-  35~55 冷   : 轻仓 / 竞价高开>3%不追 / 止盈+3%减半
-  <35 冰冻   : 建议空仓
-
-【评分权重】
-  正常模式最高 135，降级模式最高 110，最终归一化到 100 分制；
-  阈值：正常 75 分，降级 55 分。
-
-【次日操作计划（卖出规则）】
-  竞价判势 + 盘中操作 + 硬止损(-3%) + 阶梯止盈 + 时间止损(T+2)
+修复：
+  - "早盘09:35" → "09:35封板"（避免误读为今日）
+  - 建议日 → 用交易日历推算（跳过节假日）
 ===========================================================
 """
-# ==================== 全局 requests 超时补丁 ====================
+# ==================== requests 超时补丁 ====================
 import requests
 
-_ORIG_SESSION_REQUEST = requests.Session.request
+_ORIG = requests.Session.request
 _TIMEOUT = (3, 8)
 
 
-def _patched_session_request(self, method, url, **kwargs):
-    if kwargs.get("timeout") is None:
-        kwargs["timeout"] = _TIMEOUT
-    return _ORIG_SESSION_REQUEST(self, method, url, **kwargs)
+def _patched(self, method, url, **kw):
+    if kw.get("timeout") is None:
+        kw["timeout"] = _TIMEOUT
+    return _ORIG(self, method, url, **kw)
 
 
-requests.Session.request = _patched_session_request
-
-_ORIG_API_REQUEST = requests.api.request
-
-
-def _patched_api_request(method, url, **kwargs):
-    if kwargs.get("timeout") is None:
-        kwargs["timeout"] = _TIMEOUT
-    return _ORIG_API_REQUEST(method, url, **kwargs)
+requests.Session.request = _patched
+_ORIG_API = requests.api.request
 
 
-requests.api.request = _patched_api_request
-requests.get = lambda url, **kw: _patched_api_request("get", url, **kw)
-requests.post = lambda url, **kw: _patched_api_request("post", url, **kw)
-# =================================================================
+def _patched_api(method, url, **kw):
+    if kw.get("timeout") is None:
+        kw["timeout"] = _TIMEOUT
+    return _ORIG_API(method, url, **kw)
+
+
+requests.api.request = _patched_api
+requests.get = lambda url, **kw: _patched_api("get", url, **kw)
+requests.post = lambda url, **kw: _patched_api("post", url, **kw)
+# =============================================================
 
 import argparse
 import json
@@ -117,24 +65,16 @@ DEFAULT_TOP_N = 15
 RETRY_COUNT = 2
 RETRY_DELAY = 2
 FUND_FAIL_THRESHOLD = 2
-KL_INE_FAIL_THRESHOLD = 3
+KLINE_FAIL_THRESHOLD = 3
 DEFAULT_MIN_SCORE = 75
 DEGRADED_MIN_SCORE = 55
-PROBE_N = 1
 
 SCORE_TIME_BUDGET = 120
 SLOW_CALL_THRESHOLD = 3.0
 SLOW_CALL_MAX = 5
 
-FALLBACK_STRONG_CNT = 3
-FALLBACK_STRONG_CNT_LOW = 2
-FALLBACK_TOTAL_ZT_LOW = 30
-FALLBACK_WEAK_SEAL = 2e8
-
 WEAK_STRENGTH_LOW = 10
 WEAK_STRENGTH_HIGH = 40
-
-# v6.5：强势主线阈值（有资金流 / 无资金流两种）
 STRONG_THRESHOLD_WITH_NET = 60
 STRONG_THRESHOLD_NO_NET = 50
 
@@ -143,12 +83,8 @@ TEMP_WARM = 55
 TEMP_COLD = 35
 
 HARD_FILTERS = {
-    "st": True,
-    "max_boards": 3,
-    "max_turnover": 28.0,
-    "one_word": True,
-    "min_market_cap": 15.0,
-    "late_afternoon": True,
+    "st": True, "max_boards": 3, "max_turnover": 28.0,
+    "one_word": True, "min_market_cap": 15.0, "late_afternoon": True,
     "seal_ratio_one_word": 0.08,
 }
 
@@ -163,17 +99,18 @@ WEIGHTS_DEGRADED = {
     "market_cap_bonus": 10, "turnover_good": 10, "seal_amount": 10, "limit_gene": 0,
 }
 
-# ==================== 全局熔断状态 ====================
+# ==================== 全局状态 ====================
 _fund_circuit_broken = False
 _fund_fail_count = 0
 _fund_em_fail = 0
+_fund_fast_fail = False
 _kline_circuit_broken = False
 _kline_fail_count = 0
 _kline_em_fail = 0
-_fund_fast_fail = False
 _kline_fast_fail = False
 _slow_fund_calls = 0
 _slow_kline_calls = 0
+_trade_calendar_cache = None
 
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
        "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -181,7 +118,7 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 
 
 # ==================== 基础工具 ====================
-def log(msg: str, level: str = "INFO"):
+def log(msg, level="INFO"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
@@ -205,18 +142,14 @@ def retry_with_backoff(func, *args, **kwargs):
     return None
 
 
-def _dump_debug(df, label: str):
+def _dump_debug(df, label):
     try:
         os.makedirs("debug", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         if isinstance(df, pd.DataFrame):
-            df.head(30).to_csv(f"debug/{label}_{ts}.csv", index=False, encoding="utf-8-sig")
-            log(f"🐞 落盘: debug/{label}_{ts}.csv | shape={df.shape}")
-        else:
-            with open(f"debug/{label}_{ts}.txt", "w", encoding="utf-8") as f:
-                f.write(f"type={type(df)}\nrepr={repr(df)[:1000]}\n")
-    except Exception as e:
-        log(f"⚠ 落盘失败: {e}", "WARN")
+            df.head(50).to_csv(f"debug/{label}_{ts}.csv", index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
 
 
 def _to_num(x):
@@ -233,7 +166,7 @@ def _to_int(x):
         return 1
 
 
-def _is_chinese(s: str) -> bool:
+def _is_chinese(s):
     return bool(re.search(r"[\u4e00-\u9fa5]", str(s)))
 
 
@@ -278,34 +211,54 @@ def parse_ftime(ftime_str):
         return None
 
 
-def is_late_afternoon(ftime_str) -> bool:
+def is_late_afternoon(ftime_str):
     dt = parse_ftime(ftime_str)
     if dt is None:
         return False
     return dt > datetime(dt.year, dt.month, dt.day, 14, 30)
 
 
-def calc_next_trade_date(used_date_str: str) -> str:
-    """
-    v6.5：从数据日推算"建议日"（下一交易日）。
-    简化版：只跳过周末，不处理法定节假日。
-    返回格式：YYYY-MM-DD，失败返回"下一交易日"。
-    """
+# ==================== 交易日历 & 建议日 ====================
+def _get_trade_calendar():
+    global _trade_calendar_cache
+    if _trade_calendar_cache is not None:
+        return _trade_calendar_cache
+    try:
+        import akshare as ak
+        cal = retry_with_backoff(ak.tool_trade_date_hist_sina)
+        if cal is not None and not cal.empty and "trade_date" in cal.columns:
+            _trade_calendar_cache = set(
+                pd.to_datetime(cal["trade_date"]).dt.strftime("%Y%m%d")
+            )
+            return _trade_calendar_cache
+    except Exception:
+        pass
+    return None
+
+
+def calc_next_trade_date(used_date_str):
+    """从数据日推算下一交易日（跳周末 + 跳节假日）"""
     if not used_date_str or len(used_date_str) != 8:
         return "下一交易日"
     try:
         d = datetime.strptime(used_date_str, "%Y%m%d")
-        nxt = d + timedelta(days=1)
-        # 周六=5，周日=6 → 顺延到下周一
-        while nxt.weekday() >= 5:
-            nxt += timedelta(days=1)
-        return nxt.strftime("%Y-%m-%d")
     except Exception:
         return "下一交易日"
 
+    cal = _get_trade_calendar()
+    if cal:
+        for i in range(1, 15):
+            nxt = d + timedelta(days=i)
+            if nxt.strftime("%Y%m%d") in cal:
+                return nxt.strftime("%Y-%m-%d")
 
-# ==================== 涨停池 ====================
-def _get_recent_trade_dates(n: int = 10) -> List[str]:
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    return nxt.strftime("%Y-%m-%d")
+
+
+def _get_recent_trade_dates(n=10):
     try:
         import akshare as ak
         cal = retry_with_backoff(ak.tool_trade_date_hist_sina)
@@ -316,12 +269,12 @@ def _get_recent_trade_dates(n: int = 10) -> List[str]:
         cal = cal[cal["trade_date"] <= pd.Timestamp.today()]
         cal = cal.sort_values("trade_date", ascending=False)
         return [d.strftime("%Y%m%d") for d in cal["trade_date"].head(n)]
-    except Exception as e:
-        log(f"⚠ 交易日历失败: {e}", "WARN")
+    except Exception:
         return []
 
 
-def _normalize(df: pd.DataFrame, used_date: str) -> pd.DataFrame:
+# ==================== 涨停池 ====================
+def _normalize(df, used_date):
     mapping = {
         "代码": "code", "名称": "name", "涨跌幅": "pct_change", "最新价": "price",
         "成交额": "amount", "流通市值": "circ_market_cap", "总市值": "total_market_cap",
@@ -345,7 +298,7 @@ def _normalize(df: pd.DataFrame, used_date: str) -> pd.DataFrame:
     return df
 
 
-def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
+def get_limit_up_pool(trade_date=None):
     import akshare as ak
     if trade_date:
         candidates = [trade_date]
@@ -358,12 +311,10 @@ def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
         else:
             today = datetime.now().strftime("%Y%m%d")
             candidates = [today]
-            log(f"📡 获取涨停池: 日历不可用，直接试 today={today}")
 
     for cand in candidates:
         df = retry_with_backoff(ak.stock_zt_pool_em, cand)
         if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-            log(f"⚠ {cand} 无数据", "WARN")
             continue
         log(f"✅ 涨停池命中 {cand}: {len(df)} 只")
         _dump_debug(df, f"ztpool_ok_{cand}")
@@ -373,13 +324,13 @@ def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ==================== 新浪数据源工具 ====================
-def _sina_symbol(code: str) -> str:
+# ==================== 新浪数据源 ====================
+def _sina_symbol(code):
     code = str(code).zfill(6)
     return ("sh" if code.startswith(("6", "9")) else "sz") + code
 
 
-def _parse_lax_json(raw: str):
+def _parse_lax_json(raw):
     raw = (raw or "").strip()
     if not raw or raw in ("null", "[]", "{}"):
         return None
@@ -394,20 +345,17 @@ def _parse_lax_json(raw: str):
         return None
 
 
-def get_fund_flow_sina(code: str):
+def get_fund_flow_sina(code):
     import urllib.request
     sym = _sina_symbol(code)
     url = (f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=20&sort=opendate&asc=0&daima={sym}")
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": _UA,
-            "Referer": "http://vip.stock.finance.sina.com.cn/",
-        })
+            "User-Agent": _UA, "Referer": "http://vip.stock.finance.sina.com.cn/"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             raw = resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        log(f"⚠ 新浪资金流网络失败 {code}: {str(e)[:60]}", "WARN")
+    except Exception:
         return None
 
     data = _parse_lax_json(raw)
@@ -428,20 +376,17 @@ def get_fund_flow_sina(code: str):
     return float(sum(nets[:5])), float(sum(nets[:10]))
 
 
-def get_kline_sina(code: str, days: int = 60):
+def get_kline_sina(code, days=60):
     import urllib.request
     sym = _sina_symbol(code)
     url = (f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
            f"CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen={days}")
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": _UA,
-            "Referer": "http://finance.sina.com.cn/",
-        })
+            "User-Agent": _UA, "Referer": "http://finance.sina.com.cn/"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             raw = resp.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        log(f"⚠ 新浪K线网络失败 {code}: {str(e)[:60]}", "WARN")
+    except Exception:
         return None
 
     data = _parse_lax_json(raw)
@@ -467,36 +412,31 @@ def get_kline_sina(code: str, days: int = 60):
         return None
     df = pd.DataFrame(rows)
     df["日期"] = pd.to_datetime(df["日期"])
-    df = df.sort_values("日期").reset_index(drop=True)
-    return df
+    return df.sort_values("日期").reset_index(drop=True)
 
 
-# ==================== K线（双源）====================
-def get_kline(code: str, days: int = 60):
-    global _kline_circuit_broken, _kline_fail_count, _kline_fast_fail, _slow_kline_calls, _kline_em_fail
+# ==================== K线（双源） ====================
+def get_kline(code, days=60):
+    global _kline_circuit_broken, _kline_fail_count, _kline_fast_fail, _kline_em_fail, _slow_kline_calls
     if _kline_fast_fail:
         return None
     code = str(code).zfill(6)
 
     if not _kline_circuit_broken:
-        t_call = time.time()
+        t0 = time.time()
         try:
             import akshare as ak
             end = datetime.now()
             start = end - timedelta(days=days * 2)
             df = retry_with_backoff(
-                ak.stock_zh_a_hist,
-                symbol=code, period="daily",
-                start_date=start.strftime("%Y%m%d"),
-                end_date=end.strftime("%Y%m%d"),
-                adjust="qfq",
-            )
-            dt = time.time() - t_call
+                ak.stock_zh_a_hist, symbol=code, period="daily",
+                start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"),
+                adjust="qfq")
+            dt = time.time() - t0
             if dt > SLOW_CALL_THRESHOLD:
                 _slow_kline_calls += 1
                 if _slow_kline_calls >= SLOW_CALL_MAX:
                     _kline_circuit_broken = True
-                    log(f"🚫 东财K线慢调用过多，切换新浪源", "WARN")
             if df is not None and not df.empty:
                 if "日期" in df.columns:
                     df["日期"] = pd.to_datetime(df["日期"])
@@ -504,13 +444,11 @@ def get_kline(code: str, days: int = 60):
                 _kline_fail_count = 0
                 _kline_em_fail = 0
                 return df.tail(days)
-        except Exception as e:
-            log(f"⚠ 东财K线失败 {code}: {str(e)[:50]}", "WARN")
-
+        except Exception:
+            pass
         _kline_em_fail += 1
-        if _kline_em_fail >= KL_INE_FAIL_THRESHOLD:
+        if _kline_em_fail >= KLINE_FAIL_THRESHOLD:
             _kline_circuit_broken = True
-            log(f"🚫 东财K线连续失败{_kline_em_fail}只，切换新浪源", "WARN")
 
     df = get_kline_sina(code, days)
     if df is not None and not df.empty:
@@ -518,13 +456,12 @@ def get_kline(code: str, days: int = 60):
         return df
 
     _kline_fail_count += 1
-    if _kline_fail_count >= KL_INE_FAIL_THRESHOLD:
+    if _kline_fail_count >= KLINE_FAIL_THRESHOLD:
         _kline_fast_fail = True
-        log(f"🚫 东财+新浪K线均失败，完全熔断", "WARN")
     return None
 
 
-def check_ma_bull(df) -> bool:
+def check_ma_bull(df):
     if df is None or len(df) < 22 or "收盘" not in df.columns:
         return False
     try:
@@ -537,7 +474,7 @@ def check_ma_bull(df) -> bool:
         return False
 
 
-def check_return_shot(df) -> bool:
+def check_return_shot(df):
     if df is None or len(df) < 10 or "收盘" not in df.columns or "成交量" not in df.columns:
         return False
     try:
@@ -546,14 +483,13 @@ def check_return_shot(df) -> bool:
         shrink = v.iloc[-1] < v.iloc[-2]
         ma5 = c.rolling(5).mean().iloc[-1]
         hold_ma = c.iloc[-1] > ma5
-        today_chg = abs(c.iloc[-1] / c.iloc[-2] - 1)
-        is_small = today_chg < 0.03
+        is_small = abs(c.iloc[-1] / c.iloc[-2] - 1) < 0.03
         return up_yest and shrink and hold_ma and is_small
     except Exception:
         return False
 
 
-def check_limit_gene(df, days: int = 20) -> bool:
+def check_limit_gene(df, days=20):
     if df is None or len(df) < days + 1 or "收盘" not in df.columns:
         return False
     try:
@@ -564,42 +500,38 @@ def check_limit_gene(df, days: int = 20) -> bool:
         return False
 
 
-# ==================== 资金流（双源）====================
-def get_fund_flow(code: str):
-    global _fund_circuit_broken, _fund_fail_count, _fund_fast_fail, _slow_fund_calls, _fund_em_fail
+# ==================== 资金流（双源） ====================
+def get_fund_flow(code):
+    global _fund_circuit_broken, _fund_fail_count, _fund_fast_fail, _fund_em_fail, _slow_fund_calls
     if _fund_fast_fail:
         return 0.0, 0.0
     code = str(code).zfill(6)
 
     if not _fund_circuit_broken:
-        t_call = time.time()
+        t0 = time.time()
         try:
             import akshare as ak
             mkt = "sh" if code.startswith(("6", "9")) else "sz"
             df = retry_with_backoff(ak.stock_individual_fund_flow, stock=code, market=mkt)
-            dt = time.time() - t_call
+            dt = time.time() - t0
             if dt > SLOW_CALL_THRESHOLD:
                 _slow_fund_calls += 1
                 if _slow_fund_calls >= SLOW_CALL_MAX:
                     _fund_circuit_broken = True
-                    log(f"🚫 东财资金流慢调用过多，切换新浪源", "WARN")
-
             if df is not None and not df.empty:
                 col = _find_col(df, "主力净流入")
                 if col:
                     df = df.sort_values(df.columns[0], ascending=False)
-                    net_5 = pd.to_numeric(df[col].head(5), errors="coerce").sum()
-                    net_10 = pd.to_numeric(df[col].head(10), errors="coerce").sum()
+                    n5 = pd.to_numeric(df[col].head(5), errors="coerce").sum()
+                    n10 = pd.to_numeric(df[col].head(10), errors="coerce").sum()
                     _fund_fail_count = 0
                     _fund_em_fail = 0
-                    return float(net_5), float(net_10)
-        except Exception as e:
-            log(f"⚠ 东财资金流失败 {code}: {str(e)[:50]}", "WARN")
-
+                    return float(n5), float(n10)
+        except Exception:
+            pass
         _fund_em_fail += 1
         if _fund_em_fail >= FUND_FAIL_THRESHOLD:
             _fund_circuit_broken = True
-            log(f"🚫 东财资金流连续失败{_fund_em_fail}只，切换新浪源", "WARN")
 
     r = get_fund_flow_sina(code)
     if r is not None:
@@ -609,27 +541,23 @@ def get_fund_flow(code: str):
     _fund_fail_count += 1
     if _fund_fail_count >= FUND_FAIL_THRESHOLD:
         _fund_fast_fail = True
-        log(f"🚫 东财+新浪资金流均失败，完全熔断", "WARN")
     return 0.0, 0.0
 
 
-# ==================== 板块数据源 ====================
+# ==================== 板块数据 ====================
 def _fetch_industry_from_em_direct():
     import urllib.request
     url = ("https://push2.eastmoney.com/api/qt/clist/get"
            "?pn=1&pz=200&po=1&np=1&fltt=2&invt=2&fid=f3"
-           "&fs=m:90+t:2+f:!50"
-           "&fields=f12,f14,f3,f62,f104,f105,f106")
+           "&fs=m:90+t:2+f:!50&fields=f12,f14,f3,f62,f104,f105,f106")
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": _UA,
-            "Referer": "https://quote.eastmoney.com/",
-            "Accept": "application/json, text/plain, */*",
-        })
+            "User-Agent": _UA, "Referer": "https://quote.eastmoney.com/",
+            "Accept": "application/json, text/plain, */*"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             raw = resp.read().decode("utf-8", errors="ignore").strip()
     except Exception as e:
-        log(f"⚠ 东财push2直连失败: {str(e)[:80]}", "WARN")
+        log(f"⚠ 东财push2失败: {str(e)[:60]}", "WARN")
         return None
 
     if not raw.startswith("{"):
@@ -638,8 +566,7 @@ def _fetch_industry_from_em_direct():
             raw = raw[i:j + 1]
     try:
         data = json.loads(raw)
-    except Exception as e:
-        log(f"⚠ 东财push2 JSON解析失败: {str(e)[:60]}", "WARN")
+    except Exception:
         return None
 
     diff = (data.get("data") or {}).get("diff") or []
@@ -655,9 +582,9 @@ def _fetch_industry_from_em_direct():
             "板块": name, "5日涨幅": 0.0,
             "当日涨幅": _to_num(r.get("f3", 0)),
             "主力净流入": _to_num(r.get("f62", 0)),
-            "来源": "东财push2",
+            "来源": "push2",
         })
-    log(f"✅ 东财push2行业源: {len(out)} 个板块")
+    log(f"✅ 东财push2: {len(out)} 个板块")
     return pd.DataFrame(out)
 
 
@@ -666,31 +593,25 @@ def _fetch_industry_from_sina():
     url = "http://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": _UA,
-            "Referer": "http://finance.sina.com.cn/",
-        })
+            "User-Agent": _UA, "Referer": "http://finance.sina.com.cn/"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             raw = resp.read().decode("gbk", errors="ignore")
     except Exception as e:
-        log(f"⚠ 新浪行业源失败: {str(e)[:80]}", "WARN")
+        log(f"⚠ 新浪行业失败: {str(e)[:60]}", "WARN")
         return None
 
     m = re.search(r"=\s*(\{.*\})", raw, re.S)
     if not m:
-        log(f"⚠ 新浪行业源格式异常", "WARN")
         return None
     try:
         data = json.loads(m.group(1))
-    except Exception as e:
-        log(f"⚠ 新浪行业源 JSON 解析失败: {str(e)[:60]}", "WARN")
+    except Exception:
         return None
 
     out = []
-    skipped = 0
     for code, val in data.items():
         parts = [p.strip() for p in str(val).split(",")]
         if len(parts) < 5:
-            skipped += 1
             continue
         name_idx = -1
         for i in range(min(3, len(parts))):
@@ -698,145 +619,55 @@ def _fetch_industry_from_sina():
                 name_idx = i
                 break
         if name_idx < 0:
-            skipped += 1
             continue
-        name = parts[name_idx]
         pct_idx = name_idx + 4
-        amount_idx = name_idx + 6
+        amt_idx = name_idx + 6
         if len(parts) <= pct_idx:
-            skipped += 1
             continue
         out.append({
-            "板块":     name,
-            "5日涨幅":  0.0,
+            "板块": parts[name_idx], "5日涨幅": 0.0,
             "当日涨幅": _to_num(parts[pct_idx]),
             "主力净流入": 0.0,
-            "成交额万":  _to_num(parts[amount_idx]) if len(parts) > amount_idx else 0.0,
-            "来源":     "新浪行业",
+            "成交额万": _to_num(parts[amt_idx]) if len(parts) > amt_idx else 0.0,
+            "来源": "新浪",
         })
-    log(f"✅ 新浪行业源: {len(out)} 个板块（跳过 {skipped} 条格式异常）")
-    return pd.DataFrame(out)
-
-
-def _fetch_industry_from_ths():
-    import akshare as ak
-    df = retry_with_backoff(ak.stock_board_industry_summary_ths)
-    if df is None or df.empty:
-        return None
-    name_col = _find_col(df, "板块名称", "名称", "行业")
-    pct_col = _find_col(df, "涨跌幅")
-    net_col = _find_col(df, "主力净流入", "净额", "净流入")
-    if not name_col:
-        return None
-    out = []
-    for _, r in df.iterrows():
-        out.append({"板块": str(r[name_col]),
-                    "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
-                    "当日涨幅": 0.0,
-                    "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0,
-                    "来源": "同花顺"})
-    log(f"✅ 同花顺行业源: {len(out)} 个板块")
-    return pd.DataFrame(out)
-
-
-def _fetch_industry_from_em():
-    import akshare as ak
-    df = retry_with_backoff(ak.stock_board_industry_name_em)
-    if df is None or df.empty:
-        return None
-    name_col = _find_col(df, "板块名称", "名称")
-    pct_col = _find_col(df, "涨跌幅")
-    net_col = _find_col(df, "主力净流入", "净额")
-    if not name_col:
-        return None
-    out = []
-    for _, r in df.iterrows():
-        out.append({"板块": str(r[name_col]),
-                    "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
-                    "当日涨幅": 0.0,
-                    "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0,
-                    "来源": "东财"})
-    log(f"✅ 东财行业源: {len(out)} 个板块")
-    return pd.DataFrame(out)
-
-
-def _fetch_fund_flow_rank():
-    import akshare as ak
-    try:
-        df = retry_with_backoff(ak.stock_sector_fund_flow_rank, "5日", "行业资金流")
-    except Exception as e:
-        log(f"⚠ 板块资金流排名异常: {e}", "WARN")
-        return None
-    if df is None or df.empty:
-        return None
-    name_col = _find_col(df, "板块名称", "板块")
-    net_col = _find_col(df, "主力净流入")
-    pct_col = _find_col(df, "涨跌幅")
-    if not name_col:
-        return None
-    out = []
-    for _, r in df.iterrows():
-        out.append({"板块": str(r[name_col]),
-                    "5日涨幅": _to_num(r.get(pct_col, 0)) if pct_col else 0.0,
-                    "当日涨幅": 0.0,
-                    "主力净流入": _to_num(r.get(net_col, 0)) if net_col else 0.0,
-                    "来源": "东财资金流"})
-    log(f"✅ 东财资金流排名: {len(out)} 个板块")
+    log(f"✅ 新浪行业: {len(out)} 个板块")
     return pd.DataFrame(out)
 
 
 def _build_from_limitup(zt_df):
     if zt_df is None or zt_df.empty or "industry" not in zt_df.columns:
         return pd.DataFrame()
-
     grp = zt_df.groupby("industry").agg(
         涨停家数=("code", "count"),
         封板资金合计=("seal_amount", "sum"),
-        平均封板资金=("seal_amount", "mean"),
-        平均换手=("turnover", "mean"),
     ).reset_index()
     grp = grp[~grp["industry"].isin([None, "未知", ""])]
     if grp.empty:
         return pd.DataFrame()
 
-    total_zt = int(grp["涨停家数"].sum())
-    strong_threshold = (FALLBACK_STRONG_CNT_LOW if total_zt < FALLBACK_TOTAL_ZT_LOW
-                        else FALLBACK_STRONG_CNT)
-    log(f"📊 兜底模式：总涨停 {total_zt} 家，强势阈值={strong_threshold} 家")
-
-    def _status(cnt, seal):
-        if cnt >= strong_threshold:  return "🔥强势主线"
-        elif cnt >= 2:               return "📈升温中"
-        elif cnt == 1 and seal >= FALLBACK_WEAK_SEAL: return "🌡️弱势主线"
-        return "—"
-
     out = []
     for _, r in grp.iterrows():
         cnt = int(r["涨停家数"])
         seal = float(r["封板资金合计"] or 0)
+        if cnt >= 3:
+            st = "🔥强势主线"
+        elif cnt >= 2:
+            st = "📈升温中"
+        elif cnt == 1 and seal >= 2e8:
+            st = "🌡️弱势主线"
+        else:
+            st = "—"
         out.append({
-            "板块":       str(r["industry"]),
-            "5日涨幅":     0.0, "当日涨幅": 0.0, "主力净流入": 0.0,
-            "涨停家数":     cnt,
-            "封板资金合计":  seal,
-            "平均封板资金":  float(r["平均封板资金"] or 0),
-            "平均换手":     float(r["平均换手"] or 0),
-            "来源":       "涨停池聚合",
-            "状态":       _status(cnt, seal),
-            "强度分":      cnt * 10,
+            "板块": str(r["industry"]), "5日涨幅": 0.0, "当日涨幅": 0.0,
+            "主力净流入": 0.0, "涨停家数": cnt, "封板资金合计": seal,
+            "来源": "涨停池聚合", "状态": st, "强度分": cnt * 10,
         })
-    df = pd.DataFrame(out).sort_values(
-        ["涨停家数", "封板资金合计"], ascending=[False, False]
-    ).reset_index(drop=True)
-    top3 = " | ".join(f"{r.板块}({r.涨停家数}家)" for r in df.head(3).itertuples())
-    log(f"✅ 涨停池聚合主线: {len(df)} 个板块，TOP3: {top3}")
-    return df
+    return pd.DataFrame(out).sort_values("涨停家数", ascending=False).reset_index(drop=True)
 
 
 def get_sector_rotation(zt_df=None):
-    rows, seen = [], set()
-    status = "ok"
-    source_chain = []
+    rows, seen, chains = [], set(), []
 
     try:
         d = _fetch_industry_from_em_direct()
@@ -844,9 +675,9 @@ def get_sector_rotation(zt_df=None):
             for _, r in d.iterrows():
                 if r["板块"] not in seen:
                     seen.add(r["板块"]); rows.append(r.to_dict())
-            source_chain.append("push2")
-    except Exception as e:
-        log(f"⚠ push2 异常: {e}", "WARN")
+            chains.append("push2")
+    except Exception:
+        pass
 
     if not rows:
         try:
@@ -855,69 +686,31 @@ def get_sector_rotation(zt_df=None):
                 for _, r in d.iterrows():
                     if r["板块"] not in seen:
                         seen.add(r["板块"]); rows.append(r.to_dict())
-                source_chain.append("新浪")
-        except Exception as e:
-            log(f"⚠ 新浪异常: {e}", "WARN")
-
-    if not rows:
-        try:
-            d = _fetch_industry_from_ths()
-            if d is not None and not d.empty:
-                for _, r in d.iterrows():
-                    if r["板块"] not in seen:
-                        seen.add(r["板块"]); rows.append(r.to_dict())
-                source_chain.append("同花顺")
-        except Exception as e:
-            log(f"⚠ 同花顺异常: {e}", "WARN")
-
-    if not rows:
-        try:
-            d = _fetch_industry_from_em()
-            if d is not None and not d.empty:
-                for _, r in d.iterrows():
-                    if r["板块"] not in seen:
-                        seen.add(r["板块"]); rows.append(r.to_dict())
-                source_chain.append("东财")
-        except Exception as e:
-            log(f"⚠ 东财异常: {e}", "WARN")
-
-    try:
-        d = _fetch_fund_flow_rank()
-        if d is not None and not d.empty:
-            for _, r in d.iterrows():
-                if r["板块"] in seen:
-                    for ex in rows:
-                        if ex["板块"] == r["板块"] and r["主力净流入"] != 0:
-                            ex["主力净流入"] = r["主力净流入"]
-                            if r["5日涨幅"] != 0:
-                                ex["5日涨幅"] = r["5日涨幅"]
-                            break
-                else:
-                    seen.add(r["板块"]); rows.append(r.to_dict())
-    except Exception as e:
-        log(f"⚠ 资金流排名异常: {e}", "WARN")
+                chains.append("新浪")
+        except Exception:
+            pass
 
     if not rows:
         log("⚠ 外部板块源全挂，启用涨停池聚合兜底", "WARN")
         d = _build_from_limitup(zt_df)
         if not d.empty:
-            return d, "涨停池聚合兜底（数据置信度：低）"
-        return pd.DataFrame(), "全部失败"
+            return d, "兜底"
+        return pd.DataFrame(), "失败"
 
     df = pd.DataFrame(rows).drop_duplicates(subset=["板块"]).copy()
     has_5d = "5日涨幅" in df.columns and df["5日涨幅"].abs().sum() > 0
     has_1d = "当日涨幅" in df.columns and df["当日涨幅"].abs().sum() > 0
     has_net = "主力净流入" in df.columns and df["主力净流入"].abs().sum() > 0
-    has_amount = "成交额万" in df.columns and df["成交额万"].abs().sum() > 0
-    has_real_pct = has_5d or has_1d
+    has_amt = "成交额万" in df.columns and df["成交额万"].abs().sum() > 0
+    has_pct = has_5d or has_1d
 
     if has_1d:
-        pct_median = df["当日涨幅"].median()
+        pct_med = df["当日涨幅"].median()
     elif has_5d:
-        pct_median = df["5日涨幅"].median()
+        pct_med = df["5日涨幅"].median()
     else:
-        pct_median = 0.0
-    amt_median = df["成交额万"].median() if has_amount else 0.0
+        pct_med = 0.0
+    amt_med = df["成交额万"].median() if has_amt else 0.0
 
     def _get_pct(r):
         if has_5d and r.get("5日涨幅", 0) != 0:
@@ -926,52 +719,50 @@ def get_sector_rotation(zt_df=None):
             return r.get("当日涨幅", 0), "当日"
         return 0, ""
 
-    def calc_strength(r):
+    def strength(r):
         s = 0
-        if has_real_pct:
+        if has_pct:
             pct, kind = _get_pct(r)
-            rel = pct - pct_median
+            rel = pct - pct_med
             if kind == "当日":
-                if pct >= 3:     s += 30
+                if pct >= 3: s += 30
                 elif pct >= 1.5: s += 20
                 elif pct >= 0.5: s += 15
-                elif pct >= 0:   s += 10
-                elif pct >= -1:  s += 0
-                else:            s -= 10
-                if rel >= 1.5:   s += 10
+                elif pct >= 0: s += 10
+                elif pct >= -1: s += 0
+                else: s -= 10
+                if rel >= 1.5: s += 10
                 elif rel >= 0.5: s += 5
             else:
-                if pct >= 5:     s += 30
-                elif pct >= 2:   s += 20
-                elif pct >= 0:   s += 10
-                else:            s -= 5
+                if pct >= 5: s += 30
+                elif pct >= 2: s += 20
+                elif pct >= 0: s += 10
+                else: s -= 5
             if has_net:
                 net = r["主力净流入"]
-                if net > 0:    s += 30
-                elif net < 0:  s -= 15
-            elif has_amount:
+                if net > 0: s += 30
+                elif net < 0: s -= 15
+            elif has_amt:
                 amt = r.get("成交额万", 0)
-                if amt >= amt_median * 1.5:   s += 20
-                elif amt >= amt_median:       s += 10
-                else:                         s -= 5
-            return s
+                if amt >= amt_med * 1.5: s += 20
+                elif amt >= amt_med: s += 10
+                else: s -= 5
         else:
             cnt = r.get("涨停家数", 0)
-            return 50 if cnt >= 5 else 35 if cnt >= 3 else 20 if cnt >= 2 else 10
+            s = 50 if cnt >= 5 else 35 if cnt >= 3 else 20 if cnt >= 2 else 10
+        return s
 
-    df["强度分"] = df.apply(calc_strength, axis=1)
-
-    # v6.5：无资金流时降低强势门槛
+    df["强度分"] = df.apply(strength, axis=1)
     strong_thresh = STRONG_THRESHOLD_WITH_NET if has_net else STRONG_THRESHOLD_NO_NET
 
     def label(r):
         s = r["强度分"]
-        if not has_real_pct:
+        if not has_pct:
             cnt = r.get("涨停家数", 0)
             seal = _to_num(r.get("封板资金合计", 0))
             if cnt >= 3: return "🔥强势主线"
             elif cnt >= 2: return "📈升温中"
-            elif cnt == 1 and seal >= FALLBACK_WEAK_SEAL: return "🌡️弱势主线"
+            elif cnt == 1 and seal >= 2e8: return "🌡️弱势主线"
             return "—"
         net = r["主力净流入"] if has_net else 0
         pct, _ = _get_pct(r)
@@ -993,16 +784,14 @@ def get_sector_rotation(zt_df=None):
         sort_cols.append("主力净流入"); sort_asc.append(False)
     df = df.sort_values(sort_cols, ascending=sort_asc).reset_index(drop=True)
 
-    cnt_strong = int((df["状态"] == "🔥强势主线").sum())
-    cnt_warm   = int((df["状态"] == "📈升温中").sum())
-    cnt_weak   = int((df["状态"] == "🌡️弱势主线").sum())
-    cnt_down   = int((df["状态"] == "📉走弱").sum())
-
     calib = "5日" if has_5d else ("当日" if has_1d else "兜底")
-    src_str = "+".join(source_chain) if source_chain else "无"
-    log(f"✅ 板块主线分析完成: {len(df)} 个板块 | 源={src_str} | 口径={calib}")
-    log(f"   标签分布: 🔥{cnt_strong} 📈{cnt_warm} 🌡️{cnt_weak} 📉{cnt_down}")
-    return df, status
+    src = "+".join(chains) if chains else "无"
+    n_s = int((df["状态"] == "🔥强势主线").sum())
+    n_w = int((df["状态"] == "📈升温中").sum())
+    n_k = int((df["状态"] == "🌡️弱势主线").sum())
+    n_d = int((df["状态"] == "📉走弱").sum())
+    log(f"✅ 板块主线: {len(df)} 个 | 源={src} | 口径={calib} | 🔥{n_s} 📈{n_w} 🌡️{n_k} 📉{n_d}")
+    return df, "ok"
 
 
 # ==================== 市场温度 ====================
@@ -1010,268 +799,161 @@ def calc_market_temperature(zt_df):
     if zt_df is None or zt_df.empty:
         return 0, {"涨停家数": 0, "最高连板": 0, "连板家数": 0, "炸板率": "N/A"}
 
-    zt_count = len(zt_df)
+    zt = len(zt_df)
+    cnt_score = 40 if zt >= 80 else 35 if zt >= 60 else 25 if zt >= 40 else 15 if zt >= 20 else 5
 
-    if zt_count >= 80:   cnt_score = 40
-    elif zt_count >= 60: cnt_score = 35
-    elif zt_count >= 40: cnt_score = 25
-    elif zt_count >= 20: cnt_score = 15
-    else:                cnt_score = 5
+    max_b = int(zt_df["board_count"].max()) if "board_count" in zt_df.columns else 1
+    multi_b = int((zt_df["board_count"] >= 2).sum()) if "board_count" in zt_df.columns else 0
+    ladder = 0
+    if max_b >= 4: ladder += 15
+    elif max_b >= 3: ladder += 10
+    elif max_b >= 2: ladder += 5
+    if multi_b >= 10: ladder += 15
+    elif multi_b >= 5: ladder += 10
+    elif multi_b >= 2: ladder += 5
 
-    max_board = int(zt_df["board_count"].max()) if "board_count" in zt_df.columns else 1
-    multi_board = int((zt_df["board_count"] >= 2).sum()) if "board_count" in zt_df.columns else 0
-    ladder_score = 0
-    if max_board >= 4:      ladder_score += 15
-    elif max_board >= 3:    ladder_score += 10
-    elif max_board >= 2:    ladder_score += 5
-    if multi_board >= 10:   ladder_score += 15
-    elif multi_board >= 5:  ladder_score += 10
-    elif multi_board >= 2:  ladder_score += 5
-
-    if "open_times" in zt_df.columns and zt_count > 0:
-        broken = int((zt_df["open_times"] > 0).sum())
-        broken_ratio = broken / zt_count
+    if "open_times" in zt_df.columns and zt > 0:
+        broken_ratio = int((zt_df["open_times"] > 0).sum()) / zt
     else:
         broken_ratio = 0.3
-    if broken_ratio <= 0.15:   br_score = 30
-    elif broken_ratio <= 0.25: br_score = 20
-    elif broken_ratio <= 0.35: br_score = 10
-    else:                      br_score = 0
+    br_score = 30 if broken_ratio <= 0.15 else 20 if broken_ratio <= 0.25 else 10 if broken_ratio <= 0.35 else 0
 
-    temp = cnt_score + ladder_score + br_score
-    detail = {
-        "涨停家数": zt_count,
-        "最高连板": max_board,
-        "连板家数": multi_board,
-        "炸板率":   f"{broken_ratio:.1%}",
+    return cnt_score + ladder + br_score, {
+        "涨停家数": zt, "最高连板": max_b, "连板家数": multi_b,
+        "炸板率": f"{broken_ratio:.1%}",
     }
-    return temp, detail
 
 
-def temp_label(temp):
-    if temp >= TEMP_HOT:   return "🔥 热", "满仓操作，主升浪可期"
-    if temp >= TEMP_WARM:  return "☀️ 温", "半仓操作，优先主线龙头"
-    if temp >= TEMP_COLD:  return "🌥️ 冷", "轻仓试探，严格止损"
+def temp_label(t):
+    if t >= TEMP_HOT:  return "🔥 热", "满仓操作，主升浪可期"
+    if t >= TEMP_WARM: return "☀️ 温", "半仓操作，优先主线龙头"
+    if t >= TEMP_COLD: return "🌥️ 冷", "轻仓试探，严格止损"
     return "❄️ 冰冻", "建议空仓观望"
 
 
 # ==================== 硬过滤 ====================
 def hard_filter(df):
     if df.empty:
-        return df, []
-    original = len(df)
-    reasons = []
+        return df, {}
+    stats = {}
 
     if HARD_FILTERS["st"] and "name" in df.columns:
-        mask = df["name"].astype(str).str.contains("ST|退", case=False, na=False)
-        if mask.any():
-            reasons.append(f"ST/退市: {mask.sum()}只"); df = df[~mask]
+        m = df["name"].astype(str).str.contains("ST|退", case=False, na=False)
+        if m.any():
+            stats["ST"] = int(m.sum()); df = df[~m]
 
     if "board_count" in df.columns:
-        mask = df["board_count"] > HARD_FILTERS["max_boards"]
-        if mask.any():
-            reasons.append(f"连板>3: {mask.sum()}只"); df = df[~mask]
+        m = df["board_count"] > HARD_FILTERS["max_boards"]
+        if m.any():
+            stats["连板>3"] = int(m.sum()); df = df[~m]
 
     if "turnover" in df.columns:
-        mask = df["turnover"] > HARD_FILTERS["max_turnover"]
-        if mask.any():
-            reasons.append(f"换手>28%: {mask.sum()}只"); df = df[~mask]
+        m = df["turnover"] > HARD_FILTERS["max_turnover"]
+        if m.any():
+            stats["换手>28%"] = int(m.sum()); df = df[~m]
 
-    if HARD_FILTERS["one_word"] and "seal_amount" in df.columns and "circ_market_cap" in df.columns:
+    if "seal_amount" in df.columns and "circ_market_cap" in df.columns:
         circ = df["circ_market_cap"].replace(0, np.nan)
         ratio = df["seal_amount"] / circ
-        mask = (df["open_times"].fillna(99) == 0) & (ratio > HARD_FILTERS["seal_ratio_one_word"])
-        if mask.any():
-            reasons.append(f"一字板: {mask.sum()}只"); df = df[~mask]
+        m = (df["open_times"].fillna(99) == 0) & (ratio > HARD_FILTERS["seal_ratio_one_word"])
+        if m.any():
+            stats["一字板"] = int(m.sum()); df = df[~m]
 
     if "total_market_cap" in df.columns:
-        min_cap_yuan = HARD_FILTERS["min_market_cap"] * 1e8
-        mask = df["total_market_cap"] < min_cap_yuan
-        if mask.any():
-            reasons.append(f"市值<{HARD_FILTERS['min_market_cap']}亿: {mask.sum()}只")
-            df = df[~mask]
+        m = df["total_market_cap"] < HARD_FILTERS["min_market_cap"] * 1e8
+        if m.any():
+            stats[f"市值<{HARD_FILTERS['min_market_cap']}亿"] = int(m.sum()); df = df[~m]
 
-    if HARD_FILTERS["late_afternoon"] and "first_time" in df.columns:
-        mask = df["first_time"].apply(lambda x: is_late_afternoon(x))
-        if mask.any():
-            reasons.append(f"尾盘偷袭: {mask.sum()}只"); df = df[~mask]
+    if "first_time" in df.columns:
+        m = df["first_time"].apply(is_late_afternoon)
+        if m.any():
+            stats["尾盘偷袭"] = int(m.sum()); df = df[~m]
 
-    log(f"🔍 硬过滤: 剔除{original - len(df)}只 ({', '.join(reasons) or '无'})")
-    return df, reasons
+    log(f"🔍 硬过滤: {stats if stats else '无剔除'}")
+    return df, stats
 
 
 # ==================== 评分 ====================
 def score_stock(row, sector_counts, use_fund, use_ma):
-    global _fund_circuit_broken, _kline_circuit_broken, _fund_fast_fail, _kline_fast_fail
-    weights = WEIGHTS_DEGRADED if (_fund_fast_fail or _kline_fast_fail) else WEIGHTS_NORMAL
-    score = 0
-    max_score = 0
-    reasons = []
+    global _fund_fast_fail, _kline_fast_fail
+    w = WEIGHTS_DEGRADED if (_fund_fast_fail or _kline_fast_fail) else WEIGHTS_NORMAL
+    score, max_score = 0, 0
+    hits = []  # 用于推送的简短亮点
 
     max_score += 15
     bc = _to_int(row.get("board_count", 1))
     if bc >= 2:
-        s = min(bc * weights["board_count"], 15)
+        s = min(bc * w["board_count"], 15)
         score += s
-        reasons.append(f"连板{bc}层(+{s})")
+        hits.append(f"{bc}板")
 
-    max_score += weights["sector_main"]
+    max_score += w["sector_main"]
     ind = str(row.get("industry", "未知"))
     if sector_counts.get(ind, 0) >= 3:
-        s = weights["sector_main"]
-        score += s
-        reasons.append(f"主线({ind}{sector_counts[ind]}家)(+{s})")
+        s = w["sector_main"]; score += s
+        hits.append("板块主线")
 
-    if use_fund and weights["fund_flow_5d"] > 0:
-        max_score += weights["fund_flow_5d"] + weights["fund_flow_10d"]
+    if use_fund and w["fund_flow_5d"] > 0:
+        max_score += w["fund_flow_5d"] + w["fund_flow_10d"]
         n5, n10 = get_fund_flow(str(row.get("code", "")).zfill(6))
         if n5 > 0:
-            s = min(int(n5 / 1000), weights["fund_flow_5d"]); score += s
-            reasons.append(f"5日+{n5:.0f}万(+{s})")
+            s = min(int(n5 / 1000), w["fund_flow_5d"]); score += s
+            hits.append(f"5日资金+")
         if n10 > 0:
-            s = min(int(n10 / 2000), weights["fund_flow_10d"]); score += s
-            reasons.append(f"10日+{n10:.0f}万(+{s})")
+            s = min(int(n10 / 2000), w["fund_flow_10d"]); score += s
 
-    max_score += weights["morning_lobby"]
+    max_score += w["morning_lobby"]
     ft = parse_ftime(row.get("first_time"))
     if ft and ft.hour < 10:
-        s = weights["morning_lobby"]; score += s
-        reasons.append(f"早盘{ft.strftime('%H:%M')}(+{s})")
+        s = w["morning_lobby"]; score += s
+        hits.append(f"{ft.strftime('%H:%M')}封板")
 
-    max_score += weights["no_open"]
+    max_score += w["no_open"]
     if _to_int(row.get("open_times", 1)) == 0:
-        s = weights["no_open"]; score += s
-        reasons.append(f"未开板(+{s})")
+        s = w["no_open"]; score += s
+        hits.append("未开板")
 
-    if use_ma and weights["ma_bull"] > 0:
-        max_score += weights["ma_bull"] + weights["return_shot"]
-        if weights["limit_gene"] > 0:
-            max_score += weights["limit_gene"]
+    if use_ma and w["ma_bull"] > 0:
+        max_score += w["ma_bull"] + w["return_shot"]
+        if w["limit_gene"] > 0:
+            max_score += w["limit_gene"]
         kl = get_kline(str(row.get("code", "")).zfill(6))
         if check_ma_bull(kl):
-            s = weights["ma_bull"]; score += s
-            reasons.append(f"均线多头(+{s})")
+            s = w["ma_bull"]; score += s
+            hits.append("均线多头")
         if check_return_shot(kl):
-            s = weights["return_shot"]; score += s
-            reasons.append(f"回马枪(+{s})")
-        if weights["limit_gene"] > 0 and check_limit_gene(kl, 20):
-            s = weights["limit_gene"]; score += s
-            reasons.append(f"20日涨停基因(+{s})")
+            s = w["return_shot"]; score += s
+            hits.append("回马枪")
+        if w["limit_gene"] > 0 and check_limit_gene(kl, 20):
+            s = w["limit_gene"]; score += s
+            hits.append("20日涨停基因")
 
-    max_score += weights["market_cap_bonus"]
+    max_score += w["market_cap_bonus"]
     mcap = _to_num(row.get("total_market_cap", 0))
     if 30 <= mcap / 1e8 <= 100:
-        s = weights["market_cap_bonus"]; score += s
-        reasons.append(f"市值{fmt_mcap(mcap)}(+{s})")
+        s = w["market_cap_bonus"]; score += s
 
-    max_score += weights["turnover_good"]
+    max_score += w["turnover_good"]
     to = _to_num(row.get("turnover", 0))
     if 5 <= to <= 15:
-        s = weights["turnover_good"]; score += s
-        reasons.append(f"换手{to:.1f}%健康(+{s})")
+        s = w["turnover_good"]; score += s
 
-    max_score += weights["seal_amount"]
+    max_score += w["seal_amount"]
     if _to_num(row.get("seal_amount", 0)) > 0:
-        s = weights["seal_amount"]; score += s
-        reasons.append(f"有封单(+{s})")
+        s = w["seal_amount"]; score += s
 
-    return score, max_score, reasons
-
-
-# ==================== 因子归因 ====================
-_ATTR_RULES = [
-    ("连板",   lambda n: "连板" in n),
-    ("板块主线", lambda n: "主线" in n),
-    ("5日资金", lambda n: "5日" in n),
-    ("10日资金", lambda n: "10日" in n),
-    ("早盘封板", lambda n: "早盘" in n),
-    ("未开板",  lambda n: "未开板" in n),
-    ("均线多头", lambda n: "均线多头" in n),
-    ("回马枪",  lambda n: "回马枪" in n),
-    ("涨停基因", lambda n: "涨停基因" in n),
-    ("市值",   lambda n: "市值" in n),
-    ("换手健康", lambda n: "换手" in n),
-    ("封单",   lambda n: "封单" in n),
-]
-
-
-def parse_attribution(reasons):
-    attr = {}
-    for r in reasons:
-        m = re.match(r"^(.*?)\(\+(\d+)\)$", r)
-        if not m:
-            continue
-        name = m.group(1)
-        score = int(m.group(2))
-        for label, rule in _ATTR_RULES:
-            if rule(name):
-                attr[label] = attr.get(label, 0) + score
-                break
-    return attr
-
-
-def format_attribution(attr, raw_score, top_n=5):
-    if not attr or raw_score <= 0:
-        return ""
-    items = sorted(attr.items(), key=lambda x: -x[1])[:top_n]
-    parts = []
-    for name, score in items:
-        pct = score / raw_score * 100
-        parts.append(f"{name} +{score} ({pct:.0f}%)")
-    return " | ".join(parts)
-
-
-# ==================== 次日操作计划 ====================
-def get_trade_plan_rules(temp):
-    if temp >= TEMP_HOT:
-        return 7.0, 8.0, 12.0, "满仓"
-    elif temp >= TEMP_WARM:
-        return 5.0, 5.0, 8.0, "半仓"
-    elif temp >= TEMP_COLD:
-        return 3.0, 3.0, 5.0, "轻仓"
-    else:
-        return 3.0, 3.0, 5.0, "空仓"
-
-
-def format_trade_plan(temp, df_f):
-    no_chase, half_tp, clear_tp, pos = get_trade_plan_rules(temp)
-    label, _ = temp_label(temp)
-
-    msg = "\n### 📋 次日操作计划\n"
-    msg += f"> 市场温度 **{label}**，建议仓位：**{pos}**\n"
-
-    if temp < TEMP_COLD or df_f.empty:
-        msg += "> ❄️ 当前环境下，建议**以观察为主，不实际买入**。以下规则仅供参考。\n"
-
-    msg += "\n**① 竞价阶段（9:15~9:25）**\n"
-    msg += f"- 高开 > {no_chase:.0f}%：**不追**（溢价已被抢跑）\n"
-    msg += f"- 高开 2~{no_chase:.0f}%：**60% 仓位**进场\n"
-    msg += "- 高开 0~2%：**正常仓位**进场\n"
-    msg += "- 低开 0~-2%：**观察 9:30 是否回封**再决定\n"
-    msg += "- 低开 > 2%：**放弃**\n"
-
-    msg += "\n**② 盘中操作（9:30~10:00）**\n"
-    msg += "- 快速封板 → **持有**\n"
-    msg += "- 冲高回落 → **减半**\n"
-    msg += "- 跌破 5 日均线 → **清仓**\n"
-
-    msg += "\n**③ 风控规则**\n"
-    msg += "- 硬止损：**-3%**（无条件执行）\n"
-    msg += f"- 阶梯止盈：**+{half_tp:.0f}% 减半 / +{clear_tp:.0f}% 清仓 / 涨停持有**\n"
-    msg += "- 时间止损：**T+2 未表现即离场**\n"
-
-    return msg
+    return score, max_score, hits
 
 
 # ==================== 推送 ====================
-def send_wecom_webhook(webhook_url, content):
-    if not webhook_url:
+def send_wecom_webhook(url, content):
+    if not url:
         log("⚠ WECOM_WEBHOOK 未配置", "WARN")
         return False
     try:
         import urllib.request
         req = urllib.request.Request(
-            webhook_url,
+            url,
             data=json.dumps({"msgtype": "markdown", "markdown": {"content": content}}).encode("utf-8"),
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -1303,8 +985,8 @@ def _fmt_sector_line(r):
 
     if cnt > 0 and not pct_str:
         seal = _to_num(r.get("封板资金合计", 0))
-        seal_str = f" | 封板合计{seal/1e8:.2f}亿" if seal > 0 else ""
-        return f"- {r['板块']} | 涨停{cnt}家{seal_str}（兜底口径）"
+        seal_str = f" | 封板{seal/1e8:.2f}亿" if seal > 0 else ""
+        return f"- {r['板块']} | 涨停{cnt}家{seal_str}"
 
     parts = [r['板块']]
     if pct_str: parts.append(pct_str)
@@ -1312,115 +994,104 @@ def _fmt_sector_line(r):
     return f"- {' | '.join(parts)}"
 
 
-def format_market_temp_section(temp, detail):
-    label, advice = temp_label(temp)
-    msg = "\n### 🌡️ 市场温度\n"
-    msg += f"**{label}：{temp}/100**\n"
-    msg += f"> 涨停 {detail['涨停家数']} 家 | 最高连板 {detail['最高连板']} 层 | "
-    msg += f"连板家数 {detail['连板家数']} 家 | 炸板率 {detail['炸板率']}\n"
-    msg += f"> **建议**：{advice}\n"
-    return msg
-
-
-def format_sector_section(sec_df, status):
-    if sec_df is None or sec_df.empty:
-        return "\n### 🌐 板块主线监测\n> ⚠️ 本次未取到任何板块数据，主线判断暂缺\n"
-
-    is_fallback = sec_df.attrs.get("is_fallback", False) or (status and "兜底" in str(status))
-    # v6.5：检测数据源特征
-    has_net = "主力净流入" in sec_df.columns and sec_df["主力净流入"].abs().sum() > 0
-    has_amount = "成交额万" in sec_df.columns and sec_df["成交额万"].abs().sum() > 0
-
-    msg = "\n### 🌐 板块主线监测\n"
-    if status and status != "ok":
-        msg += f"> 状态: {status}\n"
-    if is_fallback:
-        msg += "> ⚠️ 数据置信度：低（无板块涨幅/资金流，仅按涨停家数聚合）\n"
-    elif not has_net and has_amount:
-        msg += "> ℹ️ 数据源=新浪行业，**无资金流数据**，强势主线门槛已下调至 50 分\n"
-
-    strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(6)
-    if not strong.empty:
-        msg += "\n**🔥 强势主线**\n"
-        for _, r in strong.iterrows():
-            msg += _fmt_sector_line(r) + "\n"
-    else:
-        msg += "\n> 🔥 暂无达到阈值的强势主线\n"
-
-    weak = sec_df[sec_df["状态"] == "🌡️弱势主线"].head(3)
-    if not weak.empty:
-        msg += "\n**🌡️ 衰退预警**（涨幅微弱、资金不足，可能是退潮主线）\n"
-        for _, r in weak.iterrows():
-            msg += _fmt_sector_line(r) + "\n"
-
-    return msg
-
-
-def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status,
+def format_message(df, tag, filtered_stats, sec_df, sec_status,
                    min_score_used, is_degraded, temp, temp_detail):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now = datetime.now().strftime("%m-%d %H:%M")
     used = df.attrs.get("used_date", "") if hasattr(df, "attrs") else ""
 
-    # v6.5：明确"数据日 / 建议日 / 生成时间"
+    # 数据日
     if used and len(used) == 8:
         try:
-            d_used = datetime.strptime(used, "%Y%m%d")
-            used_str = d_used.strftime("%Y-%m-%d") + "（收盘）"
+            used_str = datetime.strptime(used, "%Y%m%d").strftime("%Y-%m-%d")
         except Exception:
             used_str = used
     else:
         used_str = used or "未知"
 
     next_str = calc_next_trade_date(used)
-    mode_str = "降级模式" if is_degraded else "正常"
+    label, advice = temp_label(temp)
 
-    msg = f"## 📈 每日选股推送 - {tag}\n"
-    msg += f"**数据日**: {used_str}\n"
-    msg += f"**建议日**: {next_str}（开盘前 9:15 参考本推送）\n"
-    msg += f"**生成时间**: {now} | **模式**: {mode}\n"
-    msg += f"**阈值**: {min_score_used}分（{mode_str}）\n"
+    msg = f"## 📈 每日选股 - {now} 生成\n"
+    msg += f"**数据日**: {used_str}（收盘）\n"
+    msg += f"**建议日**: {next_str}（开盘前参考）\n"
 
-    msg += format_market_temp_section(temp, temp_detail)
-    msg += format_sector_section(sec_df, sec_status)
+    # 市场温度
+    msg += f"\n### 🌡️ 市场温度：{label} {temp}/100\n"
+    msg += f"> 涨停 {temp_detail['涨停家数']} 家 | 最高 {temp_detail['最高连板']} 板 | "
+    msg += f"连板 {temp_detail['连板家数']} 家 | 炸板率 {temp_detail['炸板率']}\n"
+    msg += f"> **{advice}**\n"
 
-    msg += f"\n### 🏆 候选标的（≥{min_score_used}分，{len(df)}只）\n"
+    # 主线监控
+    if sec_df is not None and not sec_df.empty:
+        msg += f"\n### 🌐 主线监控\n"
+        if sec_status and "兜底" in str(sec_status):
+            msg += "> ⚠️ 兜底口径（无板块涨幅/资金）\n"
 
+        strong = sec_df[sec_df["状态"] == "🔥强势主线"].head(5)
+        if not strong.empty:
+            msg += "\n**🔥 强势主线**\n"
+            for _, r in strong.iterrows():
+                msg += _fmt_sector_line(r) + "\n"
+        else:
+            msg += "\n> 🔥 暂无强势主线\n"
+
+        weak = sec_df[sec_df["状态"] == "🌡️弱势主线"].head(3)
+        if not weak.empty:
+            msg += "\n**🌡️ 走弱预警**\n"
+            for _, r in weak.iterrows():
+                msg += _fmt_sector_line(r) + "\n"
+    else:
+        msg += "\n### 🌐 主线监控\n> ⚠️ 本次未取到板块数据\n"
+
+    # 候选标的
+    msg += f"\n### 🏆 候选标的（{len(df)}只）\n"
     if temp < TEMP_COLD:
-        msg += "> ❄️ **市场温度过低，建议空仓**。以下候选仅供参考，不建议实际买入。\n"
+        msg += "> ❄️ 市场冰冻，建议空仓观望\n"
     elif df.empty:
-        msg += "> 今日无符合标准的标的，建议空仓观望。\n"
-
-    if not df.empty:
+        msg += "> 今日无符合标准的标的\n"
+    else:
         for i, (_, r) in enumerate(df.head(15).iterrows(), 1):
-            msg += f"\n**{i}. {r.get('name','')}** (`{r.get('code','')}`)\n"
-            raw = r.get("raw_score", 0)
-            maxs = r.get("max_score", 100)
-            msg += f"- 评分:**{r.get('score',0)}/100**（原始 {raw}/{maxs}）| 板块:{r.get('industry','N/A')} | 连板:{_to_int(r.get('board_count',1))}\n"
-            msg += f"- 换手:{_to_num(r.get('turnover',0)):.1f}% | 市值:{fmt_mcap(r.get('total_market_cap',0))}\n"
-            attr = r.get("attribution", {})
-            attr_str = format_attribution(attr, raw, top_n=5)
-            if attr_str:
-                msg += f"- 因子归因: {attr_str}\n"
-            elif "reasons" in r and r["reasons"]:
-                msg += f"- 亮点: {'、'.join(r['reasons'][:3])}\n"
+            score = r.get("score", 0)
+            name = r.get("name", "")
+            code = r.get("code", "")
+            ind = r.get("industry", "")
+            bc = _to_int(r.get("board_count", 1))
+            to = _to_num(r.get("turnover", 0))
+            mc = fmt_mcap(r.get("total_market_cap", 0))
+            bc_str = f"{bc}板" if bc >= 2 else "首板"
+            msg += f"\n**{i}. {name}** `{code}` **{score}分**\n"
+            msg += f"> {ind} | {bc_str} | 换手{to:.1f}% | 市值{mc}\n"
+            hits = r.get("hits", [])
+            if hits:
+                msg += f"> 亮点：{' · '.join(hits[:4])}\n"
 
-    msg += format_trade_plan(temp, df)
+    # 操作建议
+    if temp >= TEMP_HOT:
+        no_chase, half_tp, clear_tp = 7.0, 8.0, 12.0
+    elif temp >= TEMP_WARM:
+        no_chase, half_tp, clear_tp = 5.0, 5.0, 8.0
+    else:
+        no_chase, half_tp, clear_tp = 3.0, 3.0, 5.0
 
-    msg += "\n### 📊 过滤统计\n"
-    for r in filtered_reasons:
-        msg += f"- {r}\n"
+    msg += f"\n### 📋 操作建议\n"
+    msg += f"- **竞价**：高开>{no_chase:.0f}%不追 / 2~{no_chase:.0f}%半仓 / 0~2%正常仓\n"
+    msg += f"- **止损**：-3% 无条件\n"
+    msg += f"- **止盈**：+{half_tp:.0f}% 减半 / +{clear_tp:.0f}% 清仓\n"
+    msg += f"- **时间**：T+2 未表现离场\n"
 
-    msg += "\n> 💡 初筛结果，不构成投资建议。数据为日终快照，非盘中实时数据。"
+    # 过滤统计（一行）
+    if filtered_stats:
+        stat_str = " · ".join(f"{k} {v}只" for k, v in filtered_stats.items())
+        msg += f"\n> 过滤：{stat_str}\n"
+    msg += "\n> 💡 初筛结果，不构成投资建议。"
     return msg
 
 
 # ==================== 主流程 ====================
 def main():
-    global _fund_circuit_broken, _kline_circuit_broken
-    global _fund_fail_count, _kline_fail_count, _fund_fast_fail, _kline_fast_fail
-    global _fund_em_fail, _kline_em_fail
+    global _fund_circuit_broken, _kline_circuit_broken, _fund_fast_fail, _kline_fast_fail
 
-    p = argparse.ArgumentParser(description="每日选股推送")
+    p = argparse.ArgumentParser()
     p.add_argument("--no-ma", action="store_true")
     p.add_argument("--no-fund", action="store_true")
     p.add_argument("--top", type=int, default=DEFAULT_TOP_N)
@@ -1438,60 +1109,50 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v6.5 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v7.0 | 模式={mode}")
 
     try:
-        user_specified_threshold = args.min_score is not None
-        min_score = args.min_score if user_specified_threshold else DEFAULT_MIN_SCORE
+        user_threshold = args.min_score is not None
+        min_score = args.min_score if user_threshold else DEFAULT_MIN_SCORE
 
         # 1. 涨停池
         df_raw = get_limit_up_pool(args.date)
         if df_raw.empty:
             send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
-                "## ⚠️ 选股未执行\n**时间**: " + datetime.now().strftime("%Y-%m-%d %H:%M") +
-                "\n**原因**: 最近交易日涨停池均为空")
+                "## ⚠️ 选股未执行\n**原因**: 最近交易日无涨停数据")
             sys.exit(1)
 
         # 2. 市场温度
         temp, temp_detail = calc_market_temperature(df_raw)
-        temp_lbl, temp_advice = temp_label(temp)
-        log(f"🌡️ 市场温度: {temp}/100 ({temp_lbl}) | 涨停{temp_detail['涨停家数']}家 "
-            f"最高{temp_detail['最高连板']}板 连板{temp_detail['连板家数']}家 炸板率{temp_detail['炸板率']}")
-        log(f"   建议: {temp_advice}")
+        label, advice = temp_label(temp)
+        log(f"🌡️ 市场温度: {temp}/100 ({label}) | 涨停{temp_detail['涨停家数']}家 "
+            f"最高{temp_detail['最高连板']}板 炸板率{temp_detail['炸板率']}")
 
         # 3. 板块主线
         log("🌐 板块主线监测...")
         sec_df, sec_status = get_sector_rotation(df_raw)
         if not sec_df.empty:
             sec_df.attrs["is_fallback"] = "兜底" in str(sec_status)
-        log(f"🌐 板块数据 rows={len(sec_df)} | status={sec_status}")
-        if not sec_df.empty:
-            top3_parts = [f"{r['板块']}({r.get('状态','—')})" for _, r in sec_df.head(3).iterrows()]
-            log(f"✅ 板块TOP3: {' | '.join(top3_parts)}")
-            _dump_debug(sec_df, "sector_rotation_result")
+            _dump_debug(sec_df, "sector_rotation")
 
         # 4. 板块统计
         sector_counts = {}
         if "industry" in df_raw.columns:
             sector_counts = df_raw["industry"].value_counts().to_dict()
-            top3 = sorted(sector_counts.items(), key=lambda x: (-x[1], x[0]))[:3]
-            log(f"📊 涨停板块TOP3: {' | '.join(f'{k}({v})' for k,v in top3)}")
 
         # 5. 硬过滤
-        df, filtered_reasons = hard_filter(df_raw)
+        df, filtered_stats = hard_filter(df_raw)
         if df.empty:
-            log("📭 过滤后无标的")
             send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
-                              format_message(df, mode, tag, filtered_reasons, sec_df, sec_status,
-                                             min_score, is_degraded=False, temp=temp, temp_detail=temp_detail))
+                format_message(df, tag, filtered_stats, sec_df, sec_status,
+                               min_score, False, temp, temp_detail))
             return
 
-        # 6. 探针预检
-        log(f"🔬 探针预检接口可用性（{PROBE_N} 只）...")
+        # 6. 探针
+        log("🔬 探针预检...")
         probe_fund_ok = False
         probe_kline_ok = False
-        probe = df.head(min(PROBE_N, len(df)))
-        for _, row in probe.iterrows():
+        for _, row in df.head(1).iterrows():
             code = str(row.get("code", "")).zfill(6)
             if not args.no_fund:
                 n5, n10 = get_fund_flow(code)
@@ -1502,78 +1163,66 @@ def main():
                 if kl is not None and not kl.empty:
                     probe_kline_ok = True
 
+        # 探针后：东财已证不可用 → 直接熔断，评分全走新浪
         if not args.no_fund:
             if not probe_fund_ok:
                 _fund_fast_fail = True
-                log(f"🚫 探针资金流：东财+新浪均失败，完全熔断", "WARN")
-            elif _fund_em_fail > 0 and not _fund_circuit_broken:
+                log("🚫 资金流完全熔断", "WARN")
+            else:
                 _fund_circuit_broken = True
-                log(f"🚫 探针东财失败、新浪可用 → 熔断东财，评分阶段全部走新浪", "WARN")
-
+                log("🚫 东财资金流熔断（探针成功 → 全走新浪）", "WARN")
         if not args.no_ma:
             if not probe_kline_ok:
                 _kline_fast_fail = True
-                log(f"🚫 探针K线：东财+新浪均失败，完全熔断", "WARN")
-            elif _kline_em_fail > 0 and not _kline_circuit_broken:
+                log("🚫 K线完全熔断", "WARN")
+            else:
                 _kline_circuit_broken = True
-                log(f"🚫 探针东财失败、新浪可用 → 熔断东财K线，评分阶段全部走新浪", "WARN")
+                log("🚫 东财K线熔断（探针成功 → 全走新浪）", "WARN")
 
-        log(f"🔬 预检完成: 资金={('✅可用' if probe_fund_ok else '❌熔断')} "
-            f"K线={('✅可用' if probe_kline_ok else '❌熔断')}")
+        log(f"🔬 预检完成: 资金={('✅' if probe_fund_ok else '❌')} K线={('✅' if probe_kline_ok else '❌')}")
 
-        # 7. 降级判定
+        # 7. 降级
         use_fund = not args.no_fund and not _fund_fast_fail
         use_ma = not args.no_ma and not _kline_fast_fail
         is_degraded = False
-        if (_fund_fast_fail or _kline_fast_fail) and not user_specified_threshold:
+        if (_fund_fast_fail or _kline_fast_fail) and not user_threshold:
             min_score = DEGRADED_MIN_SCORE
             is_degraded = True
-            log(f"⚠️ 接口降级，阈值自动从{DEFAULT_MIN_SCORE}调整为{min_score}", "WARN")
+            log(f"⚠️ 降级模式，阈值→{min_score}")
 
         # 8. 评分
-        log(f"📝 开始评分 {len(df)} 只（资金={'开' if use_fund else '关'} "
-            f"均线={'开' if use_ma else '关'} 阈值={min_score} 预算={SCORE_TIME_BUDGET}s）...")
-        t_start = time.time()
-        budget_exhausted = False
-        raw_scores, max_scores, norm_scores, all_reasons, attributions = [], [], [], [], []
+        log(f"📝 评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'} 阈值={min_score}）...")
+        t0 = time.time()
+        budget_hit = False
+        scores, maxes, norms, hits_list = [], [], [], []
 
         for idx, (_, row) in enumerate(df.iterrows()):
-            elapsed = time.time() - t_start
-            if elapsed > SCORE_TIME_BUDGET and not budget_exhausted:
-                budget_exhausted = True
-                if not _fund_fast_fail:
-                    _fund_fast_fail = True
-                if not _kline_fast_fail:
-                    _kline_fast_fail = True
-                log(f"⏰ 评分阶段超预算 {elapsed:.0f}s，剩余 {len(df)-idx} 只改走降级权重", "WARN")
-                if not user_specified_threshold:
+            if time.time() - t0 > SCORE_TIME_BUDGET and not budget_hit:
+                budget_hit = True
+                if not _fund_fast_fail: _fund_fast_fail = True
+                if not _kline_fast_fail: _kline_fast_fail = True
+                log(f"⏰ 超预算 {time.time()-t0:.0f}s，剩余走降级", "WARN")
+                if not user_threshold:
                     min_score = DEGRADED_MIN_SCORE
                     is_degraded = True
 
-            _use_net = not budget_exhausted and not (_fund_fast_fail and _kline_fast_fail)
-            raw, mx, rs = score_stock(row, sector_counts,
-                                      use_fund=use_fund and _use_net and not _fund_fast_fail,
-                                      use_ma=use_ma and _use_net and not _kline_fast_fail)
+            _net = not budget_hit and not (_fund_fast_fail and _kline_fast_fail)
+            raw, mx, hits = score_stock(
+                row, sector_counts,
+                use_fund=use_fund and _net and not _fund_fast_fail,
+                use_ma=use_ma and _net and not _kline_fast_fail)
             norm = int(round(raw / mx * 100)) if mx > 0 else 0
-            raw_scores.append(raw)
-            max_scores.append(mx)
-            norm_scores.append(norm)
-            all_reasons.append(rs)
-            attributions.append(parse_attribution(rs))
-
-            if (idx + 1) % 10 == 0:
-                log(f"  ⏳ {idx+1}/{len(df)} 只 ({time.time()-t_start:.1f}s)")
+            scores.append(raw); maxes.append(mx); norms.append(norm); hits_list.append(hits)
 
         df = df.copy()
-        df["raw_score"] = raw_scores
-        df["max_score"] = max_scores
-        df["score"] = norm_scores
-        df["reasons"] = all_reasons
-        df["attribution"] = attributions
+        df["raw_score"] = scores
+        df["max_score"] = maxes
+        df["score"] = norms
+        df["hits"] = hits_list
         df_f = df[df["score"] >= min_score].sort_values(
             ["score", "raw_score"], ascending=[False, False]
         ).head(args.top)
-        log(f"✅ 达标 {len(df_f)} 只 ≥ {min_score}分 ({time.time()-t_start:.1f}s)")
+        log(f"✅ 达标 {len(df_f)} 只 ≥ {min_score}分 ({time.time()-t0:.1f}s)")
 
         # 9. 落盘
         out_dir = os.environ.get("OUTPUT_DIR", "results")
@@ -1589,9 +1238,9 @@ def main():
 
         # 10. 推送
         send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
-                          format_message(df_f, mode, tag, filtered_reasons, sec_df, sec_status,
+                          format_message(df_f, tag, filtered_stats, sec_df, sec_status,
                                          min_score, is_degraded, temp, temp_detail))
-        log("✅ 选股完成")
+        log("✅ 完成")
 
     except Exception as e:
         log(f"❌ 异常: {e}", "ERROR")
