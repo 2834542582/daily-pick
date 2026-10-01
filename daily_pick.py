@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 v7.0 —— 精简版
+每日选股推送 v7.1 —— 早晚双推
 ===========================================================
-只做四件事：
-  1. 每日推送
-  2. 主线监控（强势 + 走弱预警）
-  3. 候选股（含评分）
-  4. 操作建议
+两个模式：
+  1. 主推送（默认，16:00 运行）
+     - 全量选股 + 主线监控 + 候选股 + 操作建议
+  2. 早盘提醒（--brief，08:50 运行）
+     - 读最近 CSV，只提醒 + 竞价规则
 
-砍掉：
-  - 因子归因（只写 CSV，不进推送）
-  - 冗长的次日操作计划（精简成 4 行）
-  - 调试信息外泄到推送
+日期过滤（定时触发时生效，手动触发不过滤）：
+  - 主推送：今天非交易日 → 直接退出
+  - 早盘提醒：今天非交易日 → 直接退出
+  - 避免节假日重复推送
 
-修复：
-  - "早盘09:35" → "09:35封板"（避免误读为今日）
-  - 建议日 → 用交易日历推算（跳过节假日）
+数据源优先级：
+  - 板块：push2 → 新浪 → 兜底
+  - 个股资金流：东财 → 新浪
+  - K线：东财 → 新浪
 ===========================================================
 """
 # ==================== requests 超时补丁 ====================
@@ -45,7 +46,7 @@ def _patched_api(method, url, **kw):
 requests.api.request = _patched_api
 requests.get = lambda url, **kw: _patched_api("get", url, **kw)
 requests.post = lambda url, **kw: _patched_api("post", url, **kw)
-# =============================================================
+# ============================================================
 
 import argparse
 import json
@@ -81,6 +82,8 @@ STRONG_THRESHOLD_NO_NET = 50
 TEMP_HOT = 75
 TEMP_WARM = 55
 TEMP_COLD = 35
+
+BRIEF_MAX_DAYS = 5   # 早盘提醒的 CSV 有效期（天）
 
 HARD_FILTERS = {
     "st": True, "max_boards": 3, "max_turnover": 28.0,
@@ -218,8 +221,9 @@ def is_late_afternoon(ftime_str):
     return dt > datetime(dt.year, dt.month, dt.day, 14, 30)
 
 
-# ==================== 交易日历 & 建议日 ====================
+# ==================== 交易日历 ====================
 def _get_trade_calendar():
+    """返回交易日集合（YYYYMMDD 字符串），失败返回 None"""
     global _trade_calendar_cache
     if _trade_calendar_cache is not None:
         return _trade_calendar_cache
@@ -234,6 +238,18 @@ def _get_trade_calendar():
     except Exception:
         pass
     return None
+
+
+def is_trade_date(date_str):
+    """判断是否交易日。日历不可用时仅判断周末。"""
+    cal = _get_trade_calendar()
+    if cal:
+        return date_str in cal
+    try:
+        d = datetime.strptime(date_str, "%Y%m%d")
+        return d.weekday() < 5
+    except Exception:
+        return False
 
 
 def calc_next_trade_date(used_date_str):
@@ -415,7 +431,7 @@ def get_kline_sina(code, days=60):
     return df.sort_values("日期").reset_index(drop=True)
 
 
-# ==================== K线（双源） ====================
+# ==================== K线（双源）====================
 def get_kline(code, days=60):
     global _kline_circuit_broken, _kline_fail_count, _kline_fast_fail, _kline_em_fail, _slow_kline_calls
     if _kline_fast_fail:
@@ -500,7 +516,7 @@ def check_limit_gene(df, days=20):
         return False
 
 
-# ==================== 资金流（双源） ====================
+# ==================== 资金流（双源）====================
 def get_fund_flow(code):
     global _fund_circuit_broken, _fund_fail_count, _fund_fast_fail, _fund_em_fail, _slow_fund_calls
     if _fund_fast_fail:
@@ -878,7 +894,7 @@ def score_stock(row, sector_counts, use_fund, use_ma):
     global _fund_fast_fail, _kline_fast_fail
     w = WEIGHTS_DEGRADED if (_fund_fast_fail or _kline_fast_fail) else WEIGHTS_NORMAL
     score, max_score = 0, 0
-    hits = []  # 用于推送的简短亮点
+    hits = []
 
     max_score += 15
     bc = _to_int(row.get("board_count", 1))
@@ -898,7 +914,7 @@ def score_stock(row, sector_counts, use_fund, use_ma):
         n5, n10 = get_fund_flow(str(row.get("code", "")).zfill(6))
         if n5 > 0:
             s = min(int(n5 / 1000), w["fund_flow_5d"]); score += s
-            hits.append(f"5日资金+")
+            hits.append("5日资金+")
         if n10 > 0:
             s = min(int(n10 / 2000), w["fund_flow_10d"]); score += s
 
@@ -945,7 +961,7 @@ def score_stock(row, sector_counts, use_fund, use_ma):
     return score, max_score, hits
 
 
-# ==================== 推送 ====================
+# ==================== 推送基础 ====================
 def send_wecom_webhook(url, content):
     if not url:
         log("⚠ WECOM_WEBHOOK 未配置", "WARN")
@@ -994,12 +1010,12 @@ def _fmt_sector_line(r):
     return f"- {' | '.join(parts)}"
 
 
-def format_message(df, tag, filtered_stats, sec_df, sec_status,
-                   min_score_used, is_degraded, temp, temp_detail):
+# ==================== 主推送格式化 ====================
+def format_main_message(df, tag, filtered_stats, sec_df, sec_status,
+                        min_score_used, is_degraded, temp, temp_detail):
     now = datetime.now().strftime("%m-%d %H:%M")
     used = df.attrs.get("used_date", "") if hasattr(df, "attrs") else ""
 
-    # 数据日
     if used and len(used) == 8:
         try:
             used_str = datetime.strptime(used, "%Y%m%d").strftime("%Y-%m-%d")
@@ -1015,13 +1031,11 @@ def format_message(df, tag, filtered_stats, sec_df, sec_status,
     msg += f"**数据日**: {used_str}（收盘）\n"
     msg += f"**建议日**: {next_str}（开盘前参考）\n"
 
-    # 市场温度
     msg += f"\n### 🌡️ 市场温度：{label} {temp}/100\n"
     msg += f"> 涨停 {temp_detail['涨停家数']} 家 | 最高 {temp_detail['最高连板']} 板 | "
     msg += f"连板 {temp_detail['连板家数']} 家 | 炸板率 {temp_detail['炸板率']}\n"
     msg += f"> **{advice}**\n"
 
-    # 主线监控
     if sec_df is not None and not sec_df.empty:
         msg += f"\n### 🌐 主线监控\n"
         if sec_status and "兜底" in str(sec_status):
@@ -1043,7 +1057,6 @@ def format_message(df, tag, filtered_stats, sec_df, sec_status,
     else:
         msg += "\n### 🌐 主线监控\n> ⚠️ 本次未取到板块数据\n"
 
-    # 候选标的
     msg += f"\n### 🏆 候选标的（{len(df)}只）\n"
     if temp < TEMP_COLD:
         msg += "> ❄️ 市场冰冻，建议空仓观望\n"
@@ -1065,7 +1078,6 @@ def format_message(df, tag, filtered_stats, sec_df, sec_status,
             if hits:
                 msg += f"> 亮点：{' · '.join(hits[:4])}\n"
 
-    # 操作建议
     if temp >= TEMP_HOT:
         no_chase, half_tp, clear_tp = 7.0, 8.0, 12.0
     elif temp >= TEMP_WARM:
@@ -1079,7 +1091,6 @@ def format_message(df, tag, filtered_stats, sec_df, sec_status,
     msg += f"- **止盈**：+{half_tp:.0f}% 减半 / +{clear_tp:.0f}% 清仓\n"
     msg += f"- **时间**：T+2 未表现离场\n"
 
-    # 过滤统计（一行）
     if filtered_stats:
         stat_str = " · ".join(f"{k} {v}只" for k, v in filtered_stats.items())
         msg += f"\n> 过滤：{stat_str}\n"
@@ -1087,11 +1098,240 @@ def format_message(df, tag, filtered_stats, sec_df, sec_status,
     return msg
 
 
-# ==================== 主流程 ====================
-def main():
+# ==================== 早盘提醒格式化（v7.1 新增）====================
+def format_brief_message(df, data_date, days_diff):
+    now = datetime.now().strftime("%m-%d %H:%M")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    msg = f"## ⏰ 早盘提醒 - {now}\n"
+    msg += f"**数据日**: {data_date.strftime('%Y-%m-%d')}（{days_diff}天前）\n"
+    msg += f"**今日**: {today_str}\n"
+
+    if days_diff > 3:
+        msg += f"> ⚠️ **数据已过期 {days_diff} 天**，隔夜消息面可能有变，谨慎参考\n"
+    elif days_diff > 1:
+        msg += f"> ℹ️ 数据为 {days_diff} 天前，留意消息面\n"
+
+    msg += f"\n### 🎯 今日候选\n"
+    if df.empty:
+        msg += "> 昨日无符合标的，建议空仓观望\n"
+    else:
+        for i, (_, r) in enumerate(df.head(8).iterrows(), 1):
+            score = r.get("score", 0)
+            name = r.get("name", "")
+            code = r.get("code", "")
+            ind = r.get("industry", "")
+            bc = _to_int(r.get("board_count", 1))
+            bc_str = f"{bc}板" if bc >= 2 else "首板"
+            msg += f"{i}. **{name}** `{code}` {score}分 —— {ind}·{bc_str}\n"
+
+    msg += f"\n### ⚙️ 竞价规则\n"
+    msg += f"- 高开 >5%：**不追**\n"
+    msg += f"- 高开 2~5%：**半仓**\n"
+    msg += f"- 高开 0~2%：**正常仓**\n"
+    msg += f"- 低开 0~-2%：**看 9:30 回封**再决定\n"
+    msg += f"- 低开 >2%：**放弃**\n"
+
+    msg += f"\n### ⚠️ 今日检查\n"
+    msg += f"- 有无隔夜利空/利好（政策、外盘）\n"
+    msg += f"- 目标股竞价量能是否正常\n"
+    msg += f"- 大盘竞价氛围（红/绿开）\n"
+
+    msg += f"\n> 💡 本提醒基于历史数据，不构成投资建议"
+    return msg
+
+
+# ==================== 早盘提醒模式（v7.1 新增）====================
+def run_brief_mode():
+    now = datetime.now()
+    today_str = now.strftime("%Y%m%d")
+
+    if not is_trade_date(today_str):
+        log(f"📅 {today_str} 非交易日，跳过早盘提醒")
+        return
+
+    log(f"⏰ 早盘提醒 | 今日 {today_str} 是交易日")
+
+    out_dir = os.environ.get("OUTPUT_DIR", "results")
+    if not os.path.isdir(out_dir):
+        log("⚠ 无 results 目录", "WARN")
+        return
+
+    # 找最近的 full 模式 CSV
+    csvs = sorted(
+        [f for f in os.listdir(out_dir)
+         if f.startswith("pick_") and f.endswith("_full.csv")],
+        reverse=True
+    )
+    if not csvs:
+        log("⚠ 无历史 full CSV", "WARN")
+        return
+
+    latest = csvs[0]
+    date_str = latest.replace("pick_", "").replace("_full.csv", "")
+    try:
+        data_date = datetime.strptime(date_str, "%Y%m%d")
+    except Exception:
+        log(f"⚠ 无法解析 CSV 日期: {latest}", "WARN")
+        return
+
+    days_diff = (now - data_date).days
+    if days_diff > BRIEF_MAX_DAYS:
+        log(f"⚠ 数据 {days_diff} 天前，超过 {BRIEF_MAX_DAYS} 天，跳过", "WARN")
+        return
+
+    log(f"📂 读取 {latest}（{days_diff} 天前）")
+    csv_path = os.path.join(out_dir, latest)
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        log(f"⚠ 读取 CSV 失败: {e}", "WARN")
+        return
+
+    msg = format_brief_message(df, data_date, days_diff)
+    send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""), msg)
+    log("✅ 早盘提醒完成")
+
+
+# ==================== 主推送模式 ====================
+def run_full_mode(args):
     global _fund_circuit_broken, _kline_circuit_broken, _fund_fast_fail, _kline_fast_fail
 
+    user_threshold = args.min_score is not None
+    min_score = args.min_score if user_threshold else DEFAULT_MIN_SCORE
+
+    # 1. 涨停池
+    df_raw = get_limit_up_pool(args.date)
+    if df_raw.empty:
+        send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
+            "## ⚠️ 选股未执行\n**原因**: 最近交易日无涨停数据")
+        return
+
+    # 2. 市场温度
+    temp, temp_detail = calc_market_temperature(df_raw)
+    label, advice = temp_label(temp)
+    log(f"🌡️ 市场温度: {temp}/100 ({label}) | 涨停{temp_detail['涨停家数']}家 "
+        f"最高{temp_detail['最高连板']}板 炸板率{temp_detail['炸板率']}")
+
+    # 3. 板块主线
+    log("🌐 板块主线监测...")
+    sec_df, sec_status = get_sector_rotation(df_raw)
+    if not sec_df.empty:
+        sec_df.attrs["is_fallback"] = "兜底" in str(sec_status)
+        _dump_debug(sec_df, "sector_rotation")
+
+    # 4. 板块统计
+    sector_counts = {}
+    if "industry" in df_raw.columns:
+        sector_counts = df_raw["industry"].value_counts().to_dict()
+
+    # 5. 硬过滤
+    df, filtered_stats = hard_filter(df_raw)
+    if df.empty:
+        send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
+            format_main_message(df, "empty", filtered_stats, sec_df, sec_status,
+                                min_score, False, temp, temp_detail))
+        return
+
+    # 6. 探针
+    log("🔬 探针预检...")
+    probe_fund_ok = False
+    probe_kline_ok = False
+    for _, row in df.head(1).iterrows():
+        code = str(row.get("code", "")).zfill(6)
+        if not args.no_fund:
+            n5, n10 = get_fund_flow(code)
+            if n5 != 0 or n10 != 0:
+                probe_fund_ok = True
+        if not args.no_ma:
+            kl = get_kline(code)
+            if kl is not None and not kl.empty:
+                probe_kline_ok = True
+
+    # 探针后：东财已证不可用 → 直接熔断，评分全走新浪
+    if not args.no_fund:
+        if not probe_fund_ok:
+            _fund_fast_fail = True
+            log("🚫 资金流完全熔断", "WARN")
+        else:
+            _fund_circuit_broken = True
+            log("🚫 东财资金流熔断（探针成功 → 全走新浪）", "WARN")
+    if not args.no_ma:
+        if not probe_kline_ok:
+            _kline_fast_fail = True
+            log("🚫 K线完全熔断", "WARN")
+        else:
+            _kline_circuit_broken = True
+            log("🚫 东财K线熔断（探针成功 → 全走新浪）", "WARN")
+
+    log(f"🔬 预检完成: 资金={('✅' if probe_fund_ok else '❌')} K线={('✅' if probe_kline_ok else '❌')}")
+
+    # 7. 降级
+    use_fund = not args.no_fund and not _fund_fast_fail
+    use_ma = not args.no_ma and not _kline_fast_fail
+    is_degraded = False
+    if (_fund_fast_fail or _kline_fast_fail) and not user_threshold:
+        min_score = DEGRADED_MIN_SCORE
+        is_degraded = True
+        log(f"⚠️ 降级模式，阈值→{min_score}")
+
+    # 8. 评分
+    log(f"📝 评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'} 阈值={min_score}）...")
+    t0 = time.time()
+    budget_hit = False
+    scores, maxes, norms, hits_list = [], [], [], []
+
+    for idx, (_, row) in enumerate(df.iterrows()):
+        if time.time() - t0 > SCORE_TIME_BUDGET and not budget_hit:
+            budget_hit = True
+            if not _fund_fast_fail: _fund_fast_fail = True
+            if not _kline_fast_fail: _kline_fast_fail = True
+            log(f"⏰ 超预算 {time.time()-t0:.0f}s，剩余走降级", "WARN")
+            if not user_threshold:
+                min_score = DEGRADED_MIN_SCORE
+                is_degraded = True
+
+        _net = not budget_hit and not (_fund_fast_fail and _kline_fast_fail)
+        raw, mx, hits = score_stock(
+            row, sector_counts,
+            use_fund=use_fund and _net and not _fund_fast_fail,
+            use_ma=use_ma and _net and not _kline_fast_fail)
+        norm = int(round(raw / mx * 100)) if mx > 0 else 0
+        scores.append(raw); maxes.append(mx); norms.append(norm); hits_list.append(hits)
+
+    df = df.copy()
+    df["raw_score"] = scores
+    df["max_score"] = maxes
+    df["score"] = norms
+    df["hits"] = hits_list
+    df_f = df[df["score"] >= min_score].sort_values(
+        ["score", "raw_score"], ascending=[False, False]
+    ).head(args.top)
+    log(f"✅ 达标 {len(df_f)} 只 ≥ {min_score}分 ({time.time()-t0:.1f}s)")
+
+    # 9. 落盘
+    out_dir = os.environ.get("OUTPUT_DIR", "results")
+    os.makedirs(out_dir, exist_ok=True)
+    if not df_f.empty:
+        cols = [c for c in ["code", "name", "score", "raw_score", "max_score",
+                             "industry", "board_count", "turnover", "total_market_cap"]
+                if c in df_f.columns]
+        used_date = df_raw.attrs.get("used_date", datetime.now().strftime("%Y%m%d"))
+        csv_path = f"{out_dir}/pick_{used_date}_full.csv"
+        df_f[cols].to_csv(csv_path, index=False, encoding="utf-8-sig")
+        log(f"💾 已保存 {len(df_f)}只 → {csv_path}")
+
+    # 10. 推送
+    send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
+                      format_main_message(df_f, "full", filtered_stats, sec_df, sec_status,
+                                          min_score, is_degraded, temp, temp_detail))
+    log("✅ 完成")
+
+
+# ==================== 主流程 ====================
+def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--brief", action="store_true", help="早盘提醒模式")
     p.add_argument("--no-ma", action="store_true")
     p.add_argument("--no-fund", action="store_true")
     p.add_argument("--top", type=int, default=DEFAULT_TOP_N)
@@ -1099,6 +1339,24 @@ def main():
     p.add_argument("--min-score", type=int, default=None)
     args = p.parse_args()
 
+    is_scheduled = os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+    today_str = datetime.now().strftime("%Y%m%d")
+
+    # 早盘提醒模式
+    if args.brief:
+        log(f"🚀 启动 v7.1 | 模式=brief | 定时={is_scheduled}")
+        if is_scheduled and not is_trade_date(today_str):
+            log(f"📅 {today_str} 非交易日，跳过早盘提醒")
+            return
+        try:
+            run_brief_mode()
+        except Exception as e:
+            log(f"❌ 早盘提醒异常: {e}", "ERROR")
+            traceback.print_exc()
+            sys.exit(1)
+        return
+
+    # 主推送模式
     if args.no_ma and args.no_fund:
         mode = "fast"
     elif args.no_fund:
@@ -1108,140 +1366,15 @@ def main():
     else:
         mode = "full"
 
-    tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v7.0 | 模式={mode}")
+    log(f"🚀 启动 v7.1 | 模式={mode} | 定时={is_scheduled}")
+
+    # 主推送也做交易日过滤（避免节假日重复推送）
+    if is_scheduled and not is_trade_date(today_str):
+        log(f"📅 {today_str} 非交易日，跳过主推送")
+        return
 
     try:
-        user_threshold = args.min_score is not None
-        min_score = args.min_score if user_threshold else DEFAULT_MIN_SCORE
-
-        # 1. 涨停池
-        df_raw = get_limit_up_pool(args.date)
-        if df_raw.empty:
-            send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
-                "## ⚠️ 选股未执行\n**原因**: 最近交易日无涨停数据")
-            sys.exit(1)
-
-        # 2. 市场温度
-        temp, temp_detail = calc_market_temperature(df_raw)
-        label, advice = temp_label(temp)
-        log(f"🌡️ 市场温度: {temp}/100 ({label}) | 涨停{temp_detail['涨停家数']}家 "
-            f"最高{temp_detail['最高连板']}板 炸板率{temp_detail['炸板率']}")
-
-        # 3. 板块主线
-        log("🌐 板块主线监测...")
-        sec_df, sec_status = get_sector_rotation(df_raw)
-        if not sec_df.empty:
-            sec_df.attrs["is_fallback"] = "兜底" in str(sec_status)
-            _dump_debug(sec_df, "sector_rotation")
-
-        # 4. 板块统计
-        sector_counts = {}
-        if "industry" in df_raw.columns:
-            sector_counts = df_raw["industry"].value_counts().to_dict()
-
-        # 5. 硬过滤
-        df, filtered_stats = hard_filter(df_raw)
-        if df.empty:
-            send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
-                format_message(df, tag, filtered_stats, sec_df, sec_status,
-                               min_score, False, temp, temp_detail))
-            return
-
-        # 6. 探针
-        log("🔬 探针预检...")
-        probe_fund_ok = False
-        probe_kline_ok = False
-        for _, row in df.head(1).iterrows():
-            code = str(row.get("code", "")).zfill(6)
-            if not args.no_fund:
-                n5, n10 = get_fund_flow(code)
-                if n5 != 0 or n10 != 0:
-                    probe_fund_ok = True
-            if not args.no_ma:
-                kl = get_kline(code)
-                if kl is not None and not kl.empty:
-                    probe_kline_ok = True
-
-        # 探针后：东财已证不可用 → 直接熔断，评分全走新浪
-        if not args.no_fund:
-            if not probe_fund_ok:
-                _fund_fast_fail = True
-                log("🚫 资金流完全熔断", "WARN")
-            else:
-                _fund_circuit_broken = True
-                log("🚫 东财资金流熔断（探针成功 → 全走新浪）", "WARN")
-        if not args.no_ma:
-            if not probe_kline_ok:
-                _kline_fast_fail = True
-                log("🚫 K线完全熔断", "WARN")
-            else:
-                _kline_circuit_broken = True
-                log("🚫 东财K线熔断（探针成功 → 全走新浪）", "WARN")
-
-        log(f"🔬 预检完成: 资金={('✅' if probe_fund_ok else '❌')} K线={('✅' if probe_kline_ok else '❌')}")
-
-        # 7. 降级
-        use_fund = not args.no_fund and not _fund_fast_fail
-        use_ma = not args.no_ma and not _kline_fast_fail
-        is_degraded = False
-        if (_fund_fast_fail or _kline_fast_fail) and not user_threshold:
-            min_score = DEGRADED_MIN_SCORE
-            is_degraded = True
-            log(f"⚠️ 降级模式，阈值→{min_score}")
-
-        # 8. 评分
-        log(f"📝 评分 {len(df)} 只（资金={'开' if use_fund else '关'} 均线={'开' if use_ma else '关'} 阈值={min_score}）...")
-        t0 = time.time()
-        budget_hit = False
-        scores, maxes, norms, hits_list = [], [], [], []
-
-        for idx, (_, row) in enumerate(df.iterrows()):
-            if time.time() - t0 > SCORE_TIME_BUDGET and not budget_hit:
-                budget_hit = True
-                if not _fund_fast_fail: _fund_fast_fail = True
-                if not _kline_fast_fail: _kline_fast_fail = True
-                log(f"⏰ 超预算 {time.time()-t0:.0f}s，剩余走降级", "WARN")
-                if not user_threshold:
-                    min_score = DEGRADED_MIN_SCORE
-                    is_degraded = True
-
-            _net = not budget_hit and not (_fund_fast_fail and _kline_fast_fail)
-            raw, mx, hits = score_stock(
-                row, sector_counts,
-                use_fund=use_fund and _net and not _fund_fast_fail,
-                use_ma=use_ma and _net and not _kline_fast_fail)
-            norm = int(round(raw / mx * 100)) if mx > 0 else 0
-            scores.append(raw); maxes.append(mx); norms.append(norm); hits_list.append(hits)
-
-        df = df.copy()
-        df["raw_score"] = scores
-        df["max_score"] = maxes
-        df["score"] = norms
-        df["hits"] = hits_list
-        df_f = df[df["score"] >= min_score].sort_values(
-            ["score", "raw_score"], ascending=[False, False]
-        ).head(args.top)
-        log(f"✅ 达标 {len(df_f)} 只 ≥ {min_score}分 ({time.time()-t0:.1f}s)")
-
-        # 9. 落盘
-        out_dir = os.environ.get("OUTPUT_DIR", "results")
-        os.makedirs(out_dir, exist_ok=True)
-        if not df_f.empty:
-            cols = [c for c in ["code", "name", "score", "raw_score", "max_score",
-                                 "industry", "board_count", "turnover", "total_market_cap"]
-                    if c in df_f.columns]
-            df_f[cols].to_csv(
-                f"{out_dir}/pick_{datetime.now().strftime('%Y%m%d')}_{mode}.csv",
-                index=False, encoding="utf-8-sig")
-            log(f"💾 已保存 {len(df_f)}只")
-
-        # 10. 推送
-        send_wecom_webhook(os.environ.get("WECOM_WEBHOOK", ""),
-                          format_message(df_f, tag, filtered_stats, sec_df, sec_status,
-                                         min_score, is_degraded, temp, temp_detail))
-        log("✅ 完成")
-
+        run_full_mode(args)
     except Exception as e:
         log(f"❌ 异常: {e}", "ERROR")
         traceback.print_exc()
