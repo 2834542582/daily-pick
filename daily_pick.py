@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-每日选股推送 - 主线增强版 v6.2
+每日选股推送 - 主线增强版 v6.3
 ===========================================================
-v6.2 相对 v6.1 的改动：
-  【P0 修复】
-  1) 评分归一化：原始分可能超过 100（最高 135），改为按实际满分归一化到 100
-     → 修复"135 分和 100 分并列，TOP15 排序失效"的问题
-  2) 新增市场温度择时：涨停家数 + 连板梯队 + 炸板率 三因子
-     → 温度低时推送建议空仓，不推候选
+v6.3 相对 v6.2 的改动：
+  【数据源双备份】
+  1) K线和资金流改为「东财优先 → 新浪回退」双源架构
+     - 海外 GitHub Actions 环境自动走新浪（东财对数据中心 IP 有地理拦截）
+     - 国内环境优先走东财（更准，含资金流细分字段）
+  2) 探针逻辑重写：探针成功即继续，失败才降级
+     - 不再"探针失败1次就熔断"，兼容"东财挂但新浪通"的场景
 
-  【日志 bug 修复】
-  3) 新浪行业源板块名修复：value 格式为 "new_blhy,玻璃行业,..."
-     扫描前 3 字段找第一个中文字段
-  4) 板块标签全"—"修复：
-     - 无资金数据时用成交额作为活跃度代理
-     - 涨幅加上"相对全市场中位数"的偏移
-     - 弱势主线阈值从 15 分下调至 10 分
+  【保留 v6.2 特性】
+  - 评分归一化（修 135 vs 100 并列 bug）
+  - 市场温度择时（涨停+梯队+炸板率）
+  - 新浪行业源板块名修复
+  - 弱势主线标签（🌡️）
+  - hard_filter 单位修复（元 vs 亿）
+  - 非交易日日期标签修复
+  - 全部熔断/降级/超时保护
 
 ===========================================================
 数据口径速查：
@@ -24,15 +26,17 @@ v6.2 相对 v6.1 的改动：
 【涨停池 stock_zt_pool_em / 东财】
   连板数含当日（首板=1）；换手率为当日（%）；
   流通/总市值单位【元】；封板资金单位【元】；
-  首次封板时间为 HHMMSS 六位数字；炸板次数=0 表示未开板；
-  所属行业为东财口径（非申万）。
+  首次封板时间为 HHMMSS 六位数字；炸板次数=0 表示未开板。
 
-【资金流 stock_individual_fund_flow / 东财】
-  主力净流入 = 超大单净额 + 大单净额；
-  本脚本用「近5日累计 / 近10日累计」，单位【元】。
+【资金流 双源】
+  东财 stock_individual_fund_flow：主力净流入 = 超大单+大单（元）
+  新浪 MoneyFlow.ssl_qsfx_zjlrqs：字段 netamount = 主力净流入（元）
+  本脚本用「近5日累计 / 近10日累计」，单位【元】
 
-【K线 stock_zh_a_hist / 东财】
-  前复权；MA5/10/20 为收盘价 SMA；涨停近似为单日涨幅 ≥ 9.8%。
+【K线 双源】
+  东财 stock_zh_a_hist：前复权（adjust="qfq"）
+  新浪 CN_MarketData.getKLineData：不复权（scale=240 日线）
+  短期（60日）内不复权与复权差异极小，均线判断可接受
 
 【板块主线】
   push2     : f3=当日涨幅(%)，f62=当日主力净流入(元)
@@ -43,14 +47,12 @@ v6.2 相对 v6.1 的改动：
 【板块标签】
   🔥强势主线 : 强度分≥60 且（无资金或资金>0）
   📈升温中   : 40≤强度分<60
-  🌡️弱势主线 : 10≤强度分<40（v6.2 阈值下调）
+  🌡️弱势主线 : 10≤强度分<40
   📉走弱     : 强度分<10 且 资金<0
   ⚠️脉冲     : 涨幅>3 且 资金<0
 
 【市场温度】
-  涨停家数分  : 满分 40
-  连板梯队分  : 满分 30
-  炸板率分    : 满分 30（越低越高）
+  涨停家数分（满分 40）+ 连板梯队分（满分 30）+ 炸板率分（满分 30）
   ≥75 热     : 满仓
   55~75 温   : 半仓
   35~55 冷   : 轻仓
@@ -65,7 +67,7 @@ v6.2 相对 v6.1 的改动：
 import requests
 
 _ORIG_SESSION_REQUEST = requests.Session.request
-_TIMEOUT = (3, 6)
+_TIMEOUT = (3, 8)
 
 
 def _patched_session_request(self, method, url, **kwargs):
@@ -122,11 +124,9 @@ FALLBACK_STRONG_CNT_LOW = 2
 FALLBACK_TOTAL_ZT_LOW = 30
 FALLBACK_WEAK_SEAL = 2e8
 
-# v6.2：弱势主线强度分区间（下限从 15 降到 10）
 WEAK_STRENGTH_LOW = 10
 WEAK_STRENGTH_HIGH = 40
 
-# v6.2：市场温度阈值
 TEMP_HOT = 75
 TEMP_WARM = 55
 TEMP_COLD = 35
@@ -153,11 +153,11 @@ WEIGHTS_DEGRADED = {
 }
 
 # ==================== 全局熔断状态 ====================
-_fund_circuit_broken = False
+_fund_circuit_broken = False    # 东财资金流熔断（仍可尝试新浪）
 _fund_fail_count = 0
-_kline_circuit_broken = False
+_kline_circuit_broken = False   # 东财K线熔断（仍可尝试新浪）
 _kline_fail_count = 0
-_fund_fast_fail = False
+_fund_fast_fail = False         # 两个源都失败，完全熔断
 _kline_fast_fail = False
 _slow_fund_calls = 0
 _slow_kline_calls = 0
@@ -341,47 +341,175 @@ def get_limit_up_pool(trade_date: str = None) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-# ==================== K线 ====================
+# ==================== 新浪数据源工具 ====================
+def _sina_symbol(code: str) -> str:
+    """600000 → sh600000 / 000001 → sz000001"""
+    code = str(code).zfill(6)
+    return ("sh" if code.startswith(("6", "9")) else "sz") + code
+
+
+def _parse_lax_json(raw: str):
+    """新浪返回的 JSON 有时 key 无引号（JS 对象），先标准解析，失败则修正 key 再解析"""
+    raw = (raw or "").strip()
+    if not raw or raw in ("null", "[]", "{}"):
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    fixed = re.sub(r'([{,])\s*([A-Za-z_]\w*)\s*:', r'\1"\2":', raw)
+    try:
+        return json.loads(fixed)
+    except Exception:
+        return None
+
+
+def get_fund_flow_sina(code: str):
+    """
+    新浪个股资金流趋势（近 20 日）。
+    接口：MoneyFlow.ssl_qsfx_zjlrqs
+    字段：netamount = 主力净流入（元）
+    返回：(net_5, net_10)，单位【元】；失败返回 None。
+    """
+    import urllib.request
+    sym = _sina_symbol(code)
+    url = (f"http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"MoneyFlow.ssl_qsfx_zjlrqs?page=1&num=20&sort=opendate&asc=0&daima={sym}")
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _UA,
+            "Referer": "http://vip.stock.finance.sina.com.cn/",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        log(f"⚠ 新浪资金流网络失败 {code}: {str(e)[:60]}", "WARN")
+        return None
+
+    data = _parse_lax_json(raw)
+    if not data or not isinstance(data, list):
+        return None
+
+    nets = []
+    for row in data[:10]:
+        if not isinstance(row, dict):
+            continue
+        v = row.get("netamount", row.get("net_amount", 0))
+        try:
+            nets.append(float(str(v).replace(",", "")))
+        except Exception:
+            continue
+    if not nets:
+        return None
+    return float(sum(nets[:5])), float(sum(nets[:10]))
+
+
+def get_kline_sina(code: str, days: int = 60):
+    """
+    新浪日 K 线（不复权）。
+    接口：CN_MarketData.getKLineData，scale=240 表示日线。
+    返回：DataFrame，列名兼容东财（日期/开盘/最高/最低/收盘/成交量）。
+    """
+    import urllib.request
+    sym = _sina_symbol(code)
+    url = (f"http://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+           f"CN_MarketData.getKLineData?symbol={sym}&scale=240&ma=no&datalen={days}")
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _UA,
+            "Referer": "http://finance.sina.com.cn/",
+        })
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        log(f"⚠ 新浪K线网络失败 {code}: {str(e)[:60]}", "WARN")
+        return None
+
+    data = _parse_lax_json(raw)
+    if not data or not isinstance(data, list):
+        return None
+
+    rows = []
+    for r in data:
+        if not isinstance(r, dict):
+            continue
+        try:
+            rows.append({
+                "日期": r.get("day"),
+                "开盘": float(r.get("open", 0)),
+                "最高": float(r.get("high", 0)),
+                "最低": float(r.get("low", 0)),
+                "收盘": float(r.get("close", 0)),
+                "成交量": float(r.get("volume", 0)),
+            })
+        except Exception:
+            continue
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["日期"] = pd.to_datetime(df["日期"])
+    df = df.sort_values("日期").reset_index(drop=True)
+    return df
+
+
+# ==================== K线（双源）====================
 def get_kline(code: str, days: int = 60):
+    """
+    K 线双源：东财优先 → 新浪回退。
+    东财熔断后自动全部走新浪。
+    """
     global _kline_circuit_broken, _kline_fail_count, _kline_fast_fail, _slow_kline_calls
-    if _kline_circuit_broken or _kline_fast_fail:
+    if _kline_fast_fail:
         return None
     code = str(code).zfill(6)
-    t_call = time.time()
-    try:
-        import akshare as ak
-        end = datetime.now()
-        start = end - timedelta(days=days * 2)
-        df = retry_with_backoff(
-            ak.stock_zh_a_hist,
-            symbol=code, period="daily",
-            start_date=start.strftime("%Y%m%d"),
-            end_date=end.strftime("%Y%m%d"),
-            adjust="qfq",
-        )
-        dt = time.time() - t_call
-        if dt > SLOW_CALL_THRESHOLD:
-            _slow_kline_calls += 1
-            log(f"🐢 K线慢调用 {code}: {dt:.1f}s（累计{_slow_kline_calls}/{SLOW_CALL_MAX}）", "WARN")
-            if _slow_kline_calls >= SLOW_CALL_MAX:
-                _kline_circuit_broken = True
-                _kline_fast_fail = True
-                log(f"🚫 K线慢调用过多，熔断", "WARN")
-                return None
-        if df is not None and not df.empty:
-            if "日期" in df.columns:
-                df["日期"] = pd.to_datetime(df["日期"])
-                df = df.sort_values("日期")
-            _kline_fail_count = 0
-            return df.tail(days)
-    except Exception as e:
-        log(f"⚠ {code} K线失败: {str(e)[:60]}", "WARN")
 
+    # ① 东财（未熔断时尝试）
+    if not _kline_circuit_broken:
+        t_call = time.time()
+        try:
+            import akshare as ak
+            end = datetime.now()
+            start = end - timedelta(days=days * 2)
+            df = retry_with_backoff(
+                ak.stock_zh_a_hist,
+                symbol=code, period="daily",
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                adjust="qfq",
+            )
+            dt = time.time() - t_call
+            if dt > SLOW_CALL_THRESHOLD:
+                _slow_kline_calls += 1
+                log(f"🐢 K线慢调用 {code}: {dt:.1f}s（累计{_slow_kline_calls}/{SLOW_CALL_MAX}）", "WARN")
+                if _slow_kline_calls >= SLOW_CALL_MAX:
+                    _kline_circuit_broken = True
+                    log(f"🚫 东财K线慢调用过多，切换新浪源", "WARN")
+
+            if df is not None and not df.empty:
+                if "日期" in df.columns:
+                    df["日期"] = pd.to_datetime(df["日期"])
+                    df = df.sort_values("日期")
+                _kline_fail_count = 0
+                return df.tail(days)
+        except Exception as e:
+            log(f"⚠ 东财K线失败 {code}: {str(e)[:50]}", "WARN")
+
+        _kline_fail_count += 1
+        if _kline_fail_count >= KL_INE_FAIL_THRESHOLD:
+            _kline_circuit_broken = True
+            log(f"🚫 东财K线连续失败{_kline_fail_count}只，切换新浪源", "WARN")
+
+    # ② 新浪（东财熔断或失败后自动走这里）
+    df = get_kline_sina(code, days)
+    if df is not None and not df.empty:
+        _kline_fail_count = 0
+        return df
+
+    # ③ 两个源都失败
     _kline_fail_count += 1
     if _kline_fail_count >= KL_INE_FAIL_THRESHOLD:
-        _kline_circuit_broken = True
         _kline_fast_fail = True
-        log(f"🚫 K线连续失败{_kline_fail_count}只，已熔断", "WARN")
+        log(f"🚫 东财+新浪K线均失败，完全熔断", "WARN")
     return None
 
 
@@ -425,47 +553,60 @@ def check_limit_gene(df, days: int = 20) -> bool:
         return False
 
 
-# ==================== 资金流 ====================
+# ==================== 资金流（双源）====================
 def get_fund_flow(code: str):
+    """
+    资金流双源：东财优先 → 新浪回退。
+    东财熔断后自动全部走新浪。
+    """
     global _fund_circuit_broken, _fund_fail_count, _fund_fast_fail, _slow_fund_calls
-    if _fund_circuit_broken or _fund_fast_fail:
+    if _fund_fast_fail:
         return 0.0, 0.0
     code = str(code).zfill(6)
-    t_call = time.time()
-    try:
-        import akshare as ak
-        mkt = "sh" if code.startswith(("6", "9")) else "sz"
-        df = retry_with_backoff(ak.stock_individual_fund_flow, stock=code, market=mkt)
-        dt = time.time() - t_call
-        if dt > SLOW_CALL_THRESHOLD:
-            _slow_fund_calls += 1
-            log(f"🐢 资金流慢调用 {code}: {dt:.1f}s（累计{_slow_fund_calls}/{SLOW_CALL_MAX}）", "WARN")
-            if _slow_fund_calls >= SLOW_CALL_MAX:
-                _fund_circuit_broken = True
-                _fund_fast_fail = True
-                log(f"🚫 资金流慢调用过多，熔断", "WARN")
-                return 0.0, 0.0
 
-        if df is None or df.empty:
-            _fund_fail_count += 1
-            return 0.0, 0.0
-        col = _find_col(df, "主力净流入")
-        if not col:
-            _fund_fail_count += 1
-            return 0.0, 0.0
-        df = df.sort_values(df.columns[0], ascending=False)
-        net_5 = pd.to_numeric(df[col].head(5), errors="coerce").sum()
-        net_10 = pd.to_numeric(df[col].head(10), errors="coerce").sum()
-        _fund_fail_count = 0
-        return float(net_5), float(net_10)
-    except Exception as e:
+    # ① 东财（未熔断时尝试）
+    if not _fund_circuit_broken:
+        t_call = time.time()
+        try:
+            import akshare as ak
+            mkt = "sh" if code.startswith(("6", "9")) else "sz"
+            df = retry_with_backoff(ak.stock_individual_fund_flow, stock=code, market=mkt)
+            dt = time.time() - t_call
+            if dt > SLOW_CALL_THRESHOLD:
+                _slow_fund_calls += 1
+                log(f"🐢 东财资金流慢调用 {code}: {dt:.1f}s（累计{_slow_fund_calls}/{SLOW_CALL_MAX}）", "WARN")
+                if _slow_fund_calls >= SLOW_CALL_MAX:
+                    _fund_circuit_broken = True
+                    log(f"🚫 东财资金流慢调用过多，切换新浪源", "WARN")
+
+            if df is not None and not df.empty:
+                col = _find_col(df, "主力净流入")
+                if col:
+                    df = df.sort_values(df.columns[0], ascending=False)
+                    net_5 = pd.to_numeric(df[col].head(5), errors="coerce").sum()
+                    net_10 = pd.to_numeric(df[col].head(10), errors="coerce").sum()
+                    _fund_fail_count = 0
+                    return float(net_5), float(net_10)
+        except Exception as e:
+            log(f"⚠ 东财资金流失败 {code}: {str(e)[:50]}", "WARN")
+
         _fund_fail_count += 1
-        log(f"⚠ 资金流失败 {code}: {str(e)[:60]}", "WARN")
         if _fund_fail_count >= FUND_FAIL_THRESHOLD:
             _fund_circuit_broken = True
-            _fund_fast_fail = True
-            log(f"🚫 资金流向连续失败{_fund_fail_count}只，已熔断", "WARN")
-        return 0.0, 0.0
+            log(f"🚫 东财资金流连续失败{_fund_fail_count}只，切换新浪源", "WARN")
+
+    # ② 新浪（东财熔断或失败后自动走这里）
+    r = get_fund_flow_sina(code)
+    if r is not None:
+        _fund_fail_count = 0
+        return r
+
+    # ③ 两个源都失败
+    _fund_fail_count += 1
+    if _fund_fail_count >= FUND_FAIL_THRESHOLD:
+        _fund_fast_fail = True
+        log(f"🚫 东财+新浪资金流均失败，完全熔断", "WARN")
+    return 0.0, 0.0
 
 
 # ==================== 板块数据源 ====================
@@ -518,9 +659,8 @@ def _fetch_industry_from_em_direct():
 
 def _fetch_industry_from_sina():
     """
-    v6.2 修复：新浪返回的 value 格式为 "new_blhy,玻璃行业,15,均价,涨跌额,涨跌幅,..."
-    或旧格式 "玻璃行业,15,均价,涨跌额,涨跌幅,..."
-    通过扫描前 3 个字段找到第一个中文字段作为板块名，并据此动态调整后续字段索引。
+    新浪行业接口。value 格式："new_blhy,玻璃行业,15,均价,涨跌额,涨跌幅,..."
+    扫描前 3 个字段找第一个中文字段作为板块名。
     """
     import urllib.request
     url = "http://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php"
@@ -552,7 +692,6 @@ def _fetch_industry_from_sina():
         if len(parts) < 5:
             skipped += 1
             continue
-        # v6.2: 找第一个中文字段作为板块名
         name_idx = -1
         for i in range(min(3, len(parts))):
             if _is_chinese(parts[i]):
@@ -562,7 +701,6 @@ def _fetch_industry_from_sina():
             skipped += 1
             continue
         name = parts[name_idx]
-        # 标准字段相对 name 的偏移（name 之后第 4 项是涨跌幅，第 6 项是成交额）
         pct_idx = name_idx + 4
         amount_idx = name_idx + 6
         if len(parts) <= pct_idx:
@@ -696,10 +834,6 @@ def _build_from_limitup(zt_df):
 
 
 def get_sector_rotation(zt_df=None):
-    """
-    板块主线监测 v6.2
-    优先级：push2 → 新浪 → 同花顺 → 东财 → 资金流排名 → 兜底
-    """
     rows, seen = [], set()
     status = "ok"
     source_chain = []
@@ -777,14 +911,12 @@ def get_sector_rotation(zt_df=None):
     has_amount = "成交额万" in df.columns and df["成交额万"].abs().sum() > 0
     has_real_pct = has_5d or has_1d
 
-    # v6.2: 计算全市场板块涨幅中位数，作为相对强弱基准
     if has_1d:
         pct_median = df["当日涨幅"].median()
     elif has_5d:
         pct_median = df["5日涨幅"].median()
     else:
         pct_median = 0.0
-
     amt_median = df["成交额万"].median() if has_amount else 0.0
 
     def _get_pct(r):
@@ -798,7 +930,6 @@ def get_sector_rotation(zt_df=None):
         s = 0
         if has_real_pct:
             pct, kind = _get_pct(r)
-            # v6.2: 用相对中位数的强弱（同时保留绝对档位）
             rel = pct - pct_median
             if kind == "当日":
                 if pct >= 3:     s += 30
@@ -807,7 +938,6 @@ def get_sector_rotation(zt_df=None):
                 elif pct >= 0:   s += 10
                 elif pct >= -1:  s += 0
                 else:            s -= 10
-                # 相对强弱的额外加分（避免全市场普跌时全挤在低档）
                 if rel >= 1.5:   s += 10
                 elif rel >= 0.5: s += 5
             else:
@@ -815,20 +945,15 @@ def get_sector_rotation(zt_df=None):
                 elif pct >= 2:   s += 20
                 elif pct >= 0:   s += 10
                 else:            s -= 5
-
             if has_net:
                 net = r["主力净流入"]
                 if net > 0:    s += 30
                 elif net < 0:  s -= 15
             elif has_amount:
-                # v6.2: 无资金数据时用成交额活跃度代理
                 amt = r.get("成交额万", 0)
-                if amt >= amt_median * 1.5:
-                    s += 20
-                elif amt >= amt_median:
-                    s += 10
-                else:
-                    s -= 5
+                if amt >= amt_median * 1.5:   s += 20
+                elif amt >= amt_median:       s += 10
+                else:                         s -= 5
             return s
         else:
             cnt = r.get("涨停家数", 0)
@@ -838,7 +963,6 @@ def get_sector_rotation(zt_df=None):
 
     def label(r):
         s = r["强度分"]
-
         if not has_real_pct:
             cnt = r.get("涨停家数", 0)
             seal = _to_num(r.get("封板资金合计", 0))
@@ -846,10 +970,8 @@ def get_sector_rotation(zt_df=None):
             elif cnt >= 2: return "📈升温中"
             elif cnt == 1 and seal >= FALLBACK_WEAK_SEAL: return "🌡️弱势主线"
             return "—"
-
         net = r["主力净流入"] if has_net else 0
         pct, _ = _get_pct(r)
-
         if s >= 60 and (not has_net or net > 0):
             return "🔥强势主线"
         if s >= 40:
@@ -880,16 +1002,8 @@ def get_sector_rotation(zt_df=None):
     return df, status
 
 
-# ==================== 市场温度（v6.2 新增）====================
+# ==================== 市场温度 ====================
 def calc_market_temperature(zt_df):
-    """
-    市场温度（0~100）。
-    口径：
-      涨停家数分（满分 40）：≥80 家→40；≥60→35；≥40→25；≥20→15；<20→5
-      连板梯队分（满分 30）：最高连板 + 2 板以上家数
-      炸板率分（满分 30）：炸板次数>0 的票占比，越低越高
-    返回：(温度, 明细 dict)
-    """
     if zt_df is None or zt_df.empty:
         return 0, {"涨停家数": 0, "最高连板": 0, "连板家数": 0, "炸板率": "N/A"}
 
@@ -983,23 +1097,22 @@ def hard_filter(df):
     return df, reasons
 
 
-# ==================== 评分（v6.2 归一化）====================
+# ==================== 评分 ====================
 def score_stock(row, sector_counts, use_fund, use_ma):
     """
     返回 (原始分, 满分, 加分理由)
-    v6.2：由调用方负责归一化到 100 分制。
     满分口径：
-      - board_count 最多 15（不是权重 ×N）
+      - board_count 最多 15
       - fund_flow 两项只在 use_fund 时计入
       - ma_bull / return_shot / limit_gene 只在 use_ma 时计入
     """
-    global _fund_circuit_broken, _kline_circuit_broken
-    weights = WEIGHTS_DEGRADED if (_fund_circuit_broken or _kline_circuit_broken) else WEIGHTS_NORMAL
+    global _fund_circuit_broken, _kline_circuit_broken, _fund_fast_fail, _kline_fast_fail
+    weights = WEIGHTS_DEGRADED if (_fund_fast_fail or _kline_fast_fail) else WEIGHTS_NORMAL
     score = 0
     max_score = 0
     reasons = []
 
-    # 1) 连板（满分 15）
+    # 1) 连板
     max_score += 15
     bc = _to_int(row.get("board_count", 1))
     if bc >= 2:
@@ -1007,7 +1120,7 @@ def score_stock(row, sector_counts, use_fund, use_ma):
         score += s
         reasons.append(f"连板{bc}层(+{s})")
 
-    # 2) 主线（固定分）
+    # 2) 主线
     max_score += weights["sector_main"]
     ind = str(row.get("industry", "未知"))
     if sector_counts.get(ind, 0) >= 3:
@@ -1015,7 +1128,7 @@ def score_stock(row, sector_counts, use_fund, use_ma):
         score += s
         reasons.append(f"主线({ind}{sector_counts[ind]}家)(+{s})")
 
-    # 3) 资金流（仅 use_fund 且权重>0）
+    # 3) 资金流
     if use_fund and weights["fund_flow_5d"] > 0:
         max_score += weights["fund_flow_5d"] + weights["fund_flow_10d"]
         n5, n10 = get_fund_flow(str(row.get("code", "")).zfill(6))
@@ -1039,8 +1152,8 @@ def score_stock(row, sector_counts, use_fund, use_ma):
         s = weights["no_open"]; score += s
         reasons.append(f"未开板(+{s})")
 
-    # 6) 均线 / 回马枪 / 涨停基因（仅 use_ma 且权重>0）
-    if use_ma and not _kline_circuit_broken and weights["ma_bull"] > 0:
+    # 6) 均线 / 回马枪 / 涨停基因
+    if use_ma and weights["ma_bull"] > 0:
         max_score += weights["ma_bull"] + weights["return_shot"]
         if weights["limit_gene"] > 0:
             max_score += weights["limit_gene"]
@@ -1176,16 +1289,11 @@ def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status,
     msg += f"**时间**: {now}{used_line} | **模式**: {mode}\n"
     msg += f"**阈值**: {min_score_used}分（{mode_str}）\n"
 
-    # 市场温度（v6.2 新增）
     msg += format_market_temp_section(temp, temp_detail)
-
-    # 板块主线
     msg += format_sector_section(sec_df, sec_status)
 
-    # 候选标的
     msg += f"\n### 🏆 候选标的（≥{min_score_used}分，{len(df)}只）\n"
 
-    # v6.2：温度过低时打警告
     if temp < TEMP_COLD:
         msg += "> ❄️ **市场温度过低，建议空仓**。以下候选仅供参考，不建议实际买入。\n"
     elif df.empty:
@@ -1211,7 +1319,8 @@ def format_message(df, mode, tag, filtered_reasons, sec_df, sec_status,
 
 # ==================== 主流程 ====================
 def main():
-    global _fund_circuit_broken, _kline_circuit_broken, _fund_fail_count, _kline_fail_count
+    global _fund_circuit_broken, _kline_circuit_broken
+    global _fund_fail_count, _kline_fail_count, _fund_fast_fail, _kline_fast_fail
 
     p = argparse.ArgumentParser(description="每日选股推送")
     p.add_argument("--no-ma", action="store_true")
@@ -1231,7 +1340,7 @@ def main():
         mode = "full"
 
     tag = f"run-{os.environ.get('GITHUB_RUN_ID', 'local')}"
-    log(f"🚀 启动 v6.2 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
+    log(f"🚀 启动 v6.3 | 模式={mode} | 日期={args.date or '今日(回溯)'}")
 
     try:
         user_specified_threshold = args.min_score is not None
@@ -1245,7 +1354,7 @@ def main():
                 "\n**原因**: 最近交易日涨停池均为空")
             sys.exit(1)
 
-        # 2. 市场温度（v6.2）
+        # 2. 市场温度
         temp, temp_detail = calc_market_temperature(df_raw)
         temp_lbl, temp_advice = temp_label(temp)
         log(f"🌡️ 市场温度: {temp}/100 ({temp_lbl}) | 涨停{temp_detail['涨停家数']}家 "
@@ -1279,37 +1388,43 @@ def main():
                                              min_score, is_degraded=False, temp=temp, temp_detail=temp_detail))
             return
 
-        # 6. 探针
+        # 6. 探针预检（v6.3：探针成功即继续）
         log(f"🔬 探针预检接口可用性（{PROBE_N} 只）...")
+        probe_fund_ok = False
+        probe_kline_ok = False
         probe = df.head(min(PROBE_N, len(df)))
         for _, row in probe.iterrows():
             code = str(row.get("code", "")).zfill(6)
             if not args.no_fund:
-                get_fund_flow(code)
-            if not args.no_ma and not _fund_circuit_broken:
-                get_kline(code)
+                n5, n10 = get_fund_flow(code)
+                if n5 != 0 or n10 != 0:
+                    probe_fund_ok = True
+            if not args.no_ma:
+                kl = get_kline(code)
+                if kl is not None and not kl.empty:
+                    probe_kline_ok = True
 
-        if not args.no_fund and _fund_fail_count > 0 and not _fund_circuit_broken:
-            _fund_circuit_broken = True
+        # 探针失败：完全熔断对应接口
+        if not args.no_fund and not probe_fund_ok:
             _fund_fast_fail = True
-            log(f"🚫 探针资金流失败（{_fund_fail_count}/{PROBE_N}），熔断", "WARN")
-        if not args.no_ma and _kline_fail_count > 0 and not _kline_circuit_broken:
-            _kline_circuit_broken = True
+            log(f"🚫 探针资金流：东财+新浪均失败，完全熔断", "WARN")
+        if not args.no_ma and not probe_kline_ok:
             _kline_fast_fail = True
-            log(f"🚫 探针K线失败（{_kline_fail_count}/{PROBE_N}），熔断", "WARN")
+            log(f"🚫 探针K线：东财+新浪均失败，完全熔断", "WARN")
 
-        log(f"🔬 预检完成: 资金熔断={_fund_circuit_broken} K线熔断={_kline_circuit_broken}")
+        log(f"🔬 预检完成: 资金={('✅可用' if probe_fund_ok else '❌熔断')} "
+            f"K线={('✅可用' if probe_kline_ok else '❌熔断')}")
 
         # 7. 降级判定
-        use_fund = not args.no_fund and not _fund_circuit_broken
-        use_ma = not args.no_ma and not _kline_circuit_broken
+        use_fund = not args.no_fund and not _fund_fast_fail
+        use_ma = not args.no_ma and not _kline_fast_fail
         is_degraded = False
-        if (_fund_circuit_broken or _kline_circuit_broken) and not user_specified_threshold:
+        if (_fund_fast_fail or _kline_fast_fail) and not user_specified_threshold:
             min_score = DEGRADED_MIN_SCORE
             is_degraded = True
             log(f"⚠️ 接口降级，阈值自动从{DEFAULT_MIN_SCORE}调整为{min_score}", "WARN")
 
-        # 8. 评分（v6.2：归一化到 100 分制）
+        # 8. 评分（归一化）
         log(f"📝 开始评分 {len(df)} 只（资金={'开' if use_fund else '关'} "
             f"均线={'开' if use_ma else '关'} 阈值={min_score} 预算={SCORE_TIME_BUDGET}s）...")
         t_start = time.time()
@@ -1320,19 +1435,19 @@ def main():
             elapsed = time.time() - t_start
             if elapsed > SCORE_TIME_BUDGET and not budget_exhausted:
                 budget_exhausted = True
-                if not _fund_circuit_broken:
-                    _fund_circuit_broken = True
-                if not _kline_circuit_broken:
-                    _kline_circuit_broken = True
+                if not _fund_fast_fail:
+                    _fund_fast_fail = True
+                if not _kline_fast_fail:
+                    _kline_fast_fail = True
                 log(f"⏰ 评分阶段超预算 {elapsed:.0f}s，剩余 {len(df)-idx} 只改走降级权重", "WARN")
                 if not user_specified_threshold:
                     min_score = DEGRADED_MIN_SCORE
                     is_degraded = True
 
-            _use_net = not budget_exhausted and not (_fund_circuit_broken and _kline_circuit_broken)
+            _use_net = not budget_exhausted and not (_fund_fast_fail and _kline_fast_fail)
             raw, mx, rs = score_stock(row, sector_counts,
-                                      use_fund=use_fund and _use_net and not _fund_circuit_broken,
-                                      use_ma=use_ma and _use_net and not _kline_circuit_broken)
+                                      use_fund=use_fund and _use_net and not _fund_fast_fail,
+                                      use_ma=use_ma and _use_net and not _kline_fast_fail)
             norm = int(round(raw / mx * 100)) if mx > 0 else 0
             raw_scores.append(raw)
             max_scores.append(mx)
