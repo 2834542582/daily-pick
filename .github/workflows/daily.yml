@@ -9,10 +9,11 @@ on:
         default: 'full'
         type: choice
         options:
-          - fast
-          - full
-          - no_fund
-          - keepalive
+          - full      # 主推送（全量）
+          - brief     # 早盘提醒（读历史）
+          - fast      # 快速模式（跳过均线）
+          - no_fund   # 无资金模式
+          - keepalive # 保活心跳
       top_n:
         description: '推送前N只'
         required: false
@@ -24,12 +25,11 @@ on:
         default: ''
         type: string
   schedule:
-    # 全部时间为 UTC，实际触发 ≈ 北京时间 = UTC + 8
-    # 【重要】GitHub Actions 的 cron 有 5~30 分钟延迟，为常态
-    - cron: '30 7 * * 1-5'   # UTC 07:30 = 北京 15:30 | 收盘即报（快速，不含均线）
-    - cron: '0 8 * * 1-5'    # UTC 08:00 = 北京 16:00 | 盘后完整复盘【主推送】
-    - cron: '0 12 * * 1-5'   # UTC 12:00 = 北京 20:00 | 晚间复盘（无资金）
-    - cron: '50 0 * * 1-6'   # UTC 00:50 = 北京 08:50 | 保活心跳
+    # 【重要】GitHub Actions cron 用 UTC，北京时间 = UTC + 8
+    # 【重要】cron 实际触发通常延迟 5~30 分钟，属正常现象
+    - cron: '0 8 * * 1-5'    # 北京 16:00 | 主推送（工作日）
+    - cron: '50 0 * * 2-6'   # 北京 08:50 | 早盘提醒（周二~周六，对应工作日次日）
+    - cron: '0 1 * * 0'      # 北京 09:00 | 保活心跳（周日）
 
 permissions:
   contents: write
@@ -46,7 +46,7 @@ jobs:
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
       OUTPUT_DIR: results
-      TZ: Asia/Shanghai   # 让脚本内 datetime.now() 显示北京时间
+      TZ: Asia/Shanghai
 
     steps:
       - uses: actions/checkout@v4
@@ -70,11 +70,10 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             case "${{ github.event.schedule }}" in
-              '30 7 * * 1-5')  MODE=fast;      TAG="收盘即报";;
-              '0 8 * * 1-5')   MODE=full;      TAG="盘后完整复盘";;
-              '0 12 * * 1-5')  MODE=no_fund;   TAG="晚间复盘";;
-              '50 0 * * 1-6')  MODE=keepalive; TAG="保活心跳";;
-              *)               MODE=fast;      TAG="未知时段-默认fast";;
+              '0 8 * * 1-5')   MODE=full;      TAG="盘后复盘";;
+              '50 0 * * 2-6')  MODE=brief;     TAG="早盘提醒";;
+              '0 1 * * 0')     MODE=keepalive; TAG="周日保活";;
+              *)               MODE=full;      TAG="未知时段-默认full";;
             esac
           else
             MODE=${{ inputs.mode || 'full' }}
@@ -89,7 +88,7 @@ jobs:
         if: steps.meta.outputs.mode == 'keepalive'
         run: |
           echo "💓 keepalive 心跳"
-          echo "last_run=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > keepalive.txt
+          date -u +%Y-%m-%dT%H:%M:%SZ > keepalive.txt
           exit 0
 
       - name: 运行选股
@@ -99,8 +98,9 @@ jobs:
         run: |
           ARGS=""
           case "${{ steps.meta.outputs.mode }}" in
-            fast)     ARGS="--no-ma --top ${{ inputs.top_n || 15 }}";;
+            brief)    ARGS="--brief";;
             full)     ARGS="--top ${{ inputs.top_n || 15 }}";;
+            fast)     ARGS="--no-ma --top ${{ inputs.top_n || 15 }}";;
             no_fund)  ARGS="--no-fund --no-ma --top ${{ inputs.top_n || 15 }}";;
           esac
           if [ -n "${{ inputs.date }}" ]; then
@@ -113,13 +113,12 @@ jobs:
         if: steps.meta.outputs.mode != 'keepalive'
         run: |
           git config user.name  "github-actions[bot]"
-          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add results/ keepalive.txt 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "📭 无新结果，跳过提交"
           else
-            git commit -m "chore: 选股结果 ${{ steps.meta.outputs.tag }} (${{ steps.meta.outputs.run_id }})"
+            git commit -m "chore: ${{ steps.meta.outputs.tag }} (${{ steps.meta.outputs.run_id }})"
             git push
           fi
 
